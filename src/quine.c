@@ -353,7 +353,7 @@ static int idx_merge(ChunkIdx *dst, const ChunkIdx *src) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §4  Patch writer (buffered)
+ * §4  Patch writer (buffered fwrite)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define PW_BUF (256u * 1024u)
@@ -528,17 +528,14 @@ static PreChunkList *reassemble_file_chunks(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §6  Zero-copy literal tracker + encode helpers
+ * §6  Zero-copy literal tracker
  *
- * Instead of copying LIT data into a heap buffer, we track the start
- * pointer and length of a contiguous literal run in the mmap'd file.
- * When flushed (at the next REF or end-of-file), the LIT opcode header
- * is written, then the data goes directly from the mmap to the patch
- * writer — one memcpy instead of three.
+ * Tracks a contiguous run of LIT data as a pointer into the mmap'd B file.
+ * When flushed, writes directly from mmap to PW — one copy, no heap buffer.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    const uint8_t *start;   /* points into mmap'd file data (not owned) */
+    const uint8_t *start;
     size_t         len;
 } LitRun;
 
@@ -558,14 +555,10 @@ static void lit_flush(LitRun *lr, PW *pw) {
     lr->len   = 0;
 }
 
-/* Extend the current literal run.  If the new chunk is not contiguous
- * with the existing run (shouldn't happen within a file), flush first. */
 static void lit_extend(LitRun *lr, PW *pw,
                         const uint8_t *data, uint32_t len) {
-    if (lr->len && lr->start + lr->len != data) {
-        /* non-contiguous — flush the old run first */
+    if (lr->len && lr->start + lr->len != data)
         lit_flush(lr, pw);
-    }
     if (!lr->len) lr->start = data;
     lr->len += len;
 }
@@ -725,10 +718,13 @@ int quine_compress(const char *dir_a, const char *dir_b,
 
     /* ── 6. Open patch file and write header ── */
     progress("write_header", NULL, 0, 0);
+
+    if (fla.count > 0xFFFF) { SET_ERR("too many A files"); goto cleanup_all; }
+    if (flb.count > 0xFFFF) { SET_ERR("too many B files"); goto cleanup_all; }
+
     PW pw;
     if (pw_open(&pw, patch_path)) {
-        SET_ERR("open patch: %s", strerror(errno));
-        goto cleanup_all;
+        SET_ERR("open patch: %s", strerror(errno)); goto cleanup_all;
     }
 
     pw_write(&pw, QN_MAGIC, 4);
@@ -737,7 +733,6 @@ int quine_compress(const char *dir_a, const char *dir_b,
     pw_u32(&pw, QN_CHUNK_AVG);
     pw_u32(&pw, QN_CHUNK_MAX);
 
-    if (fla.count > 0xFFFF) { SET_ERR("too many A files"); pw_close(&pw); goto cleanup_all; }
     pw_u16(&pw, (uint16_t)fla.count);
     for (uint32_t i = 0; i < fla.count; i++) {
         size_t plen = strlen(fla.e[i].rel); if (plen > 0xFFFF) plen = 0xFFFF;
@@ -746,7 +741,6 @@ int quine_compress(const char *dir_a, const char *dir_b,
         pw_u64(&pw, fla.e[i].size);
     }
 
-    if (flb.count > 0xFFFF) { SET_ERR("too many B files"); pw_close(&pw); goto cleanup_all; }
     pw_u16(&pw, (uint16_t)flb.count);
     for (uint32_t i = 0; i < flb.count; i++) {
         size_t plen = strlen(flb.e[i].rel); if (plen > 0xFFFF) plen = 0xFFFF;
@@ -755,12 +749,7 @@ int quine_compress(const char *dir_a, const char *dir_b,
         pw_u64(&pw, flb.e[i].size);
     }
 
-    /* ── 7. Sequential encode using pre-computed chunks + filtered lookup ──
-     *
-     * LIT runs are tracked as zero-copy pointers into the mmap'd B file.
-     * Consecutive unmatched chunks accumulate into a single LitRun;
-     * when a REF is found (or end-of-file), the LIT opcode + data are
-     * written directly from the mmap — no intermediate heap copy. */
+    /* ── 7. Sequential encode with zero-copy LIT ── */
     {
         LitRun lr = {0};
         for (uint32_t fi = 0; fi < flb.count; fi++) {
