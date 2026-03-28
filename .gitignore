@@ -1,0 +1,21 @@
+# Build outputs
+build/
+/quine
+/test_quine
+libquine.a
+libquine.so
+
+# Test artifacts
+/tmp/quine_test_*/
+
+# Runtime outputs
+output/
+*.patch
+patch-*
+
+# Editor and OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
