@@ -250,8 +250,8 @@ ratio:
 ./scripts/benchmark.sh <dir_a> <dir_b>
 ```
 
-Runs quine compress/decompress, zstd standalone (`tar | zstd`), and zstd
-delta (`zstd --patch-from`), then prints a summary table.  Requires `zstd`
+Runs quine compress/decompress and zstd delta compress/decompress
+(`zstd --patch-from`), then prints a summary table.  Requires `zstd`
 and GNU `time` (`/usr/bin/time -v`).
 
 ---
@@ -282,8 +282,9 @@ const char *quine_errmsg(void);
 /* Optional progress callback — set before calling compress/decompress.
  * Pass NULL to disable (the default).  Stored per-thread. */
 typedef struct {
-    const char *stage;    /* "scan_a","index_a","scan_b","encode_b",
-                             "write_header","read_header","restore" */
+    const char *stage;    /* "scan_a","scan_b","mmap_b","index",
+                             "merge_index","write_header","encode_b",
+                             "read_header","restore" */
     const char *file;     /* relative path, or NULL for non-file stages */
     uint32_t    current;  /* 1-based index within the stage */
     uint32_t    total;    /* total items in this stage (0 if unknown) */
@@ -310,8 +311,9 @@ quine_set_progress(my_progress, NULL);
 quine_compress("/data/v1.0", "/data/v1.1", "/tmp/update.patch");
 ```
 
-Stages reported during compression: `scan_a`, `index_a`, `scan_b`,
-`write_header`, `encode_b`.  During decompression: `read_header`, `restore`.
+Stages reported during compression: `scan_a`, `scan_b`, `mmap_b`, `index`,
+`merge_index`, `write_header`, `encode_b`.  During decompression:
+`read_header`, `restore`.
 
 Minimal usage:
 
@@ -372,9 +374,9 @@ compression time and the decompressor checks them.
 - **Max 65 535-byte relative path** per file (`u16` path-length field).
   Paths longer than 4095 bytes are also rejected by the decompressor's
   internal `abs[4096]` buffer; increase that buffer if needed.
-- **Single-threaded compression**.  The A indexing phase is embarrassingly
-  parallel; sharding files across worker threads and merging per-shard hash
-  tables is a straightforward improvement.
+- **Single-threaded encode phase**.  A and B indexing are now parallelized
+  across all CPU cores, but the final encode phase (which emits REF/LIT
+  opcodes) remains single-threaded.
 - **No literal compression**.  Bytes in B with no match in A or prior B files
   are stored verbatim.  Piping the patch through `zstd` reduces these further.
 - **No integrity check on the patch**.  Add a trailing HMAC or SHA-256 of the

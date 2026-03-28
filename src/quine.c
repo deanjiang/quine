@@ -54,17 +54,15 @@ static void progress(const char *stage, const char *file,
 #define CHUNK_MASK   ((1u << 14) - 1)          /* avg 16 KB */
 
 static uint64_t g_rabin_table[256];
-static int      g_rabin_init = 0;
+static pthread_once_t g_rabin_once = PTHREAD_ONCE_INIT;
 
 static void rabin_init_tables(void) {
-    if (g_rabin_init) return;
     for (int i = 0; i < 256; i++) {
         uint64_t h = (uint64_t)i;
         for (int j = 0; j < 8; j++)
             h = (h >> 1) ^ (RABIN_POLY & -(h & 1));
         g_rabin_table[i] = h;
     }
-    g_rabin_init = 1;
 }
 
 typedef struct {
@@ -75,7 +73,7 @@ typedef struct {
 } Rabin;
 
 static void rabin_reset(Rabin *r) {
-    rabin_init_tables();
+    pthread_once(&g_rabin_once, rabin_init_tables);
     memset(r, 0, sizeof(*r));
 }
 
@@ -390,7 +388,7 @@ static int pw_u64(PW *w, uint64_t v) {
     for(int i=0;i<8;i++) b[i]=(uint8_t)(v>>(8*i));
     return pw_write(w,b,8);
 }
-static int pw_close(PW *w) { pw_flush(w); return fclose(w->f); }
+static int pw_close(PW *w) { int r = pw_flush(w); if (fclose(w->f)) r = -1; return r; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §5  Segment-based parallel indexing
@@ -846,6 +844,11 @@ int quine_compress(const char *dir_a, const char *dir_b,
             const PreChunkList *pcl = &b_chunks[fi];
             const uint8_t *fdata = maps_b[fi].data;
 
+            if (!fdata && flb.e[fi].size > 0) {
+                SET_ERR("mmap failed for B file: %s", flb.e[fi].rel);
+                goto cleanup_all;
+            }
+
             for (uint32_t ci = 0; ci < pcl->count; ci++) {
                 const PreChunk *pc = &pcl->c[ci];
                 uint64_t chunk_global = off_b[fi] + pc->file_offset;
@@ -1088,7 +1091,6 @@ int quine_decompress(const char *dir_a,
     PR           r       = {0};   /* buf=NULL → pr_free is safe */
     SlotTable    st      = {0};
     char       **b_paths = NULL;
-    uint64_t    *b_sizes = NULL;
     uint8_t     *copybuf = NULL;
     int          out_fd  = -1;
     uint16_t     b_count = 0;
@@ -1144,8 +1146,7 @@ int quine_decompress(const char *dir_a,
         /* ── B manifest ── */
         if (pr_u16(&r, &b_count)) break;
         b_paths = calloc(b_count, sizeof(char*));
-        b_sizes = calloc(b_count, sizeof(uint64_t));
-        if (!b_paths || !b_sizes) { SET_ERR("OOM"); break; }
+        if (!b_paths) { SET_ERR("OOM"); break; }
 
         flat_pos = a_total;
         for (uint16_t i = 0; i < b_count && ok; i++) {
@@ -1161,7 +1162,6 @@ int quine_decompress(const char *dir_a,
             snprintf(abs, sizeof(abs), "%s/%s", out_dir, rel);
             free(rel);
             b_paths[i] = strdup(abs);
-            b_sizes[i] = sz;
             st_add(&st, flat_pos, sz, -1);
             flat_pos += sz;
         }
@@ -1257,7 +1257,6 @@ int quine_decompress(const char *dir_a,
     if (out_fd >= 0) close(out_fd);
     for (uint16_t i = 0; i < b_count; i++) free(b_paths[i]);
     free(b_paths);
-    free(b_sizes);
     st_free(&st);
     pr_free(&r);
     if (pfd >= 0) close(pfd);

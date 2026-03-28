@@ -153,6 +153,19 @@ static int dirs_equal(const char *a, const char *b) {
         else                     ok = files_equal(pa, pb);
     }
     closedir(da);
+    if (!ok) return 0;
+
+    /* Reverse check: verify b has no extra entries missing from a */
+    DIR *db = opendir(b);
+    if (!db) return 0;
+    while ((de = readdir(db))) {
+        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
+        char pa[4096];
+        snprintf(pa, sizeof(pa), "%s/%s", a, de->d_name);
+        struct stat st;
+        if (lstat(pa, &st)) { ok=0; break; }
+    }
+    closedir(db);
     return ok;
 }
 

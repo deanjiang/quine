@@ -118,8 +118,8 @@
  * decompress; the library invokes it at each significant step.  Pass NULL
  * to disable (the default).  The callback is stored per-thread.
  *
- * stage:   "scan_a", "index_a", "scan_b", "encode_b", "write_header",
- *          "read_header", "restore"
+ * stage:   "scan_a", "scan_b", "mmap_b", "index", "merge_index",
+ *          "write_header", "encode_b", "read_header", "restore"
  * file:    relative path of the current file, or NULL for non-file stages
  * current: 1-based index of the current item within the stage
  * total:   total items in this stage (0 if unknown)

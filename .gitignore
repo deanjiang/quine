@@ -1,9 +1,6 @@
 # Build outputs
 build/
 
-# Test artifacts
-/tmp/quine_test_*/
-
 # Runtime outputs
 output/
 *.patch
