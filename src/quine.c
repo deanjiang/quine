@@ -436,17 +436,17 @@ static int seg_add(SegList *sl, uint32_t fi, uint64_t start, uint64_t end, uint3
  */
 #define MIN_SEG_SIZE (1u * 1024 * 1024)
 
-static SegList build_segments(const MmapFile *maps, uint32_t count, int nthreads) {
+static SegList build_segments_sz(const uint64_t *sizes, uint32_t count, int nthreads) {
     SegList sl = {0};
     uint64_t total = 0;
     for (uint32_t i = 0; i < count; i++)
-        total += maps[i].size;
+        total += sizes[i];
 
     uint64_t target = total / (uint64_t)nthreads;
     if (target < MIN_SEG_SIZE) target = MIN_SEG_SIZE;
 
     for (uint32_t i = 0; i < count; i++) {
-        size_t fsz = maps[i].size;
+        uint64_t fsz = sizes[i];
         if (fsz == 0) continue;
         uint64_t off = 0;
         uint32_t si = 0;
@@ -461,17 +461,28 @@ static SegList build_segments(const MmapFile *maps, uint32_t count, int nthreads
     return sl;
 }
 
+static SegList build_segments(const MmapFile *maps, uint32_t count, int nthreads) {
+    uint64_t *sizes = malloc(count * sizeof(uint64_t));
+    if (!sizes) { SegList empty = {0}; return empty; }
+    for (uint32_t i = 0; i < count; i++) sizes[i] = maps[i].size;
+    SegList sl = build_segments_sz(sizes, count, nthreads);
+    free(sizes);
+    return sl;
+}
+
 /* Per-segment output: a PreChunkList.  Array is indexed by segment index
  * in the SegList and filled by the owning worker thread. */
+
+/* ── B segment worker: reads from mmap'd data ── */
 
 typedef struct {
     /* inputs */
     const MmapFile *maps;
-    const uint64_t *offsets;        /* global offset per file */
-    const Segment  *segs;           /* segment array (shared, read-only) */
-    uint32_t        seg_start;      /* first segment index for this thread */
-    uint32_t        seg_end;        /* exclusive */
-    PreChunkList   *seg_chunks;     /* output: one PreChunkList per segment */
+    const uint64_t *offsets;
+    const Segment  *segs;
+    uint32_t        seg_start;
+    uint32_t        seg_end;
+    PreChunkList   *seg_chunks;
     /* output */
     ChunkIdx        idx;
 } SegWork;
@@ -479,10 +490,8 @@ typedef struct {
 static void *seg_worker(void *arg) {
     SegWork *w = arg;
     uint64_t total_bytes = 0;
-    for (uint32_t i = w->seg_start; i < w->seg_end; i++) {
-        const Segment *s = &w->segs[i];
-        total_bytes += s->file_end - s->file_start;
-    }
+    for (uint32_t i = w->seg_start; i < w->seg_end; i++)
+        total_bytes += w->segs[i].file_end - w->segs[i].file_start;
     size_t est = (size_t)(total_bytes / QN_CHUNK_AVG + 64);
     idx_init_cap(&w->idx, est * IDX_LOAD_DEN / IDX_LOAD_NUM + 1);
 
@@ -494,14 +503,86 @@ static void *seg_worker(void *arg) {
         PreChunkList *pcl = &w->seg_chunks[i];
         chunk_range(data + s->file_start,
                     s->file_end - s->file_start,
-                    s->file_start,    /* base_offset within file */
-                    pcl);
+                    s->file_start, pcl);
 
         uint64_t gbase = w->offsets[s->file_idx];
         for (uint32_t c = 0; c < pcl->count; c++)
             idx_insert(&w->idx, pcl->c[c].sha,
                         gbase + pcl->c[c].file_offset, pcl->c[c].len);
     }
+    return NULL;
+}
+
+/* ── A segment worker: reads via read() — no mmap, low RSS ── */
+
+typedef struct {
+    /* inputs */
+    const char     *root;           /* dir_a path */
+    const FileList *fl;
+    const uint64_t *offsets;
+    const Segment  *segs;
+    uint32_t        seg_start;
+    uint32_t        seg_end;
+    /* output */
+    ChunkIdx        idx;
+} ASegWork;
+
+/* Read exactly n bytes from fd at offset off into buf. */
+static int full_pread(int fd, void *buf, size_t n, off_t off) {
+    uint8_t *p = buf;
+    while (n) {
+        ssize_t got = pread(fd, p, n, off);
+        if (got <= 0) return -1;
+        p += got; off += got; n -= (size_t)got;
+    }
+    return 0;
+}
+
+static void *a_seg_worker(void *arg) {
+    ASegWork *w = arg;
+    uint64_t total_bytes = 0;
+    for (uint32_t i = w->seg_start; i < w->seg_end; i++)
+        total_bytes += w->segs[i].file_end - w->segs[i].file_start;
+    size_t est = (size_t)(total_bytes / QN_CHUNK_AVG + 64);
+    idx_init_cap(&w->idx, est * IDX_LOAD_DEN / IDX_LOAD_NUM + 1);
+
+    int cur_fd = -1;
+    uint32_t cur_fi = UINT32_MAX;
+
+    for (uint32_t i = w->seg_start; i < w->seg_end; i++) {
+        const Segment *s = &w->segs[i];
+        size_t seg_sz = (size_t)(s->file_end - s->file_start);
+        if (seg_sz == 0) continue;
+
+        /* Open file if different from last segment */
+        if (s->file_idx != cur_fi) {
+            if (cur_fd >= 0) close(cur_fd);
+            char abs[4096];
+            snprintf(abs, sizeof(abs), "%s/%s", w->root, w->fl->e[s->file_idx].rel);
+            cur_fd = open(abs, O_RDONLY);
+            cur_fi = s->file_idx;
+            if (cur_fd < 0) continue;
+        }
+
+        /* Read segment into temporary buffer */
+        uint8_t *buf = malloc(seg_sz);
+        if (!buf) continue;
+        if (full_pread(cur_fd, buf, seg_sz, (off_t)s->file_start)) {
+            free(buf); continue;
+        }
+
+        /* CDC + SHA-256 + index */
+        PreChunkList tmp = {0};
+        chunk_range(buf, seg_sz, s->file_start, &tmp);
+
+        uint64_t gbase = w->offsets[s->file_idx];
+        for (uint32_t c = 0; c < tmp.count; c++)
+            idx_insert(&w->idx, tmp.c[c].sha,
+                        gbase + tmp.c[c].file_offset, tmp.c[c].len);
+        pcl_free(&tmp);
+        free(buf);
+    }
+    if (cur_fd >= 0) close(cur_fd);
     return NULL;
 }
 
@@ -584,21 +665,17 @@ int quine_compress(const char *dir_a, const char *dir_b,
     progress("scan_b", NULL, 0, 0);
     if (collect_files(dir_b, &flb)) { SET_ERR("walk B failed"); goto done; }
 
-    /* ── 2. Mmap all files with prefetch ── */
-    progress("mmap_a", NULL, 0, 0);
-    MmapFile *maps_a = mmap_all(dir_a, &fla, 1);
-    if (!maps_a) { SET_ERR("mmap A files"); goto done; }
-
+    /* ── 2. Mmap B files (needed for encode); A uses read() for indexing ── */
     progress("mmap_b", NULL, 0, 0);
     MmapFile *maps_b = mmap_all(dir_b, &flb, 1);
-    if (!maps_b) { SET_ERR("mmap B files"); munmap_all(maps_a, fla.count); goto done; }
+    if (!maps_b) { SET_ERR("mmap B files"); goto done; }
 
     /* ── 3. Build global offset tables ── */
     uint64_t *off_a = malloc(fla.count * sizeof(uint64_t));
     uint64_t *off_b = malloc(flb.count * sizeof(uint64_t));
     if ((!off_a && fla.count) || (!off_b && flb.count)) {
         SET_ERR("OOM offsets"); free(off_a); free(off_b);
-        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+        munmap_all(maps_b, flb.count); goto done;
     }
     uint64_t flat_pos = 0;
     for (uint32_t i = 0; i < fla.count; i++) {
@@ -609,7 +686,15 @@ int quine_compress(const char *dir_a, const char *dir_b,
     }
 
     /* ── 4. Build segments and launch parallel workers ── */
-    SegList segs_a = build_segments(maps_a, fla.count, nth);
+    /* A segments from file sizes (no mmap); B segments from mmap'd data */
+    uint64_t *a_sizes = malloc(fla.count * sizeof(uint64_t));
+    if (!a_sizes && fla.count) {
+        SET_ERR("OOM"); free(off_a); free(off_b);
+        munmap_all(maps_b, flb.count); goto done;
+    }
+    for (uint32_t i = 0; i < fla.count; i++) a_sizes[i] = fla.e[i].size;
+    SegList segs_a = build_segments_sz(a_sizes, fla.count, nth);
+    free(a_sizes);
     SegList segs_b = build_segments(maps_b, flb.count, nth);
 
     int nth_a = nth;
@@ -622,35 +707,34 @@ int quine_compress(const char *dir_a, const char *dir_b,
 
     int total_threads = nth_a + nth_b;
 
-    PreChunkList *seg_chunks_a = calloc(segs_a.count, sizeof(PreChunkList));
     PreChunkList *seg_chunks_b = calloc(segs_b.count, sizeof(PreChunkList));
-    SegWork      *a_works      = calloc(nth_a, sizeof(SegWork));
+    ASegWork     *a_works      = calloc(nth_a, sizeof(ASegWork));
     SegWork      *b_works      = calloc(nth_b, sizeof(SegWork));
     pthread_t    *tids         = calloc(total_threads, sizeof(pthread_t));
 
-    if (!seg_chunks_a || !seg_chunks_b || !a_works || !b_works || !tids) {
+    if (!seg_chunks_b || !a_works || !b_works || !tids) {
         SET_ERR("OOM threads");
-        free(seg_chunks_a); free(seg_chunks_b);
+        free(seg_chunks_b);
         free(a_works); free(b_works); free(tids);
         free(segs_a.s); free(segs_b.s);
         free(off_a); free(off_b);
-        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+        munmap_all(maps_b, flb.count); goto done;
     }
 
-    /* Distribute segments across threads (round-robin by byte budget) */
+    /* Distribute segments across threads */
     {
-        /* A threads */
+        /* A threads — read()-based workers */
         uint32_t per = segs_a.count / (uint32_t)nth_a;
         uint32_t rem = segs_a.count % (uint32_t)nth_a;
         uint32_t pos = 0;
         for (int t = 0; t < nth_a; t++) {
-            a_works[t].maps       = maps_a;
-            a_works[t].offsets    = off_a;
-            a_works[t].segs       = segs_a.s;
-            a_works[t].seg_chunks = seg_chunks_a;
-            a_works[t].seg_start  = pos;
+            a_works[t].root      = dir_a;
+            a_works[t].fl        = &fla;
+            a_works[t].offsets   = off_a;
+            a_works[t].segs      = segs_a.s;
+            a_works[t].seg_start = pos;
             uint32_t n = per + (t < (int)rem ? 1 : 0);
-            a_works[t].seg_end    = pos + n;
+            a_works[t].seg_end   = pos + n;
             pos += n;
         }
         /* B threads */
@@ -673,7 +757,7 @@ int quine_compress(const char *dir_a, const char *dir_b,
 
     int ti = 0;
     for (int t = 0; t < nth_a; t++)
-        pthread_create(&tids[ti++], NULL, seg_worker, &a_works[t]);
+        pthread_create(&tids[ti++], NULL, a_seg_worker, &a_works[t]);
     for (int t = 0; t < nth_b; t++)
         pthread_create(&tids[ti++], NULL, seg_worker, &b_works[t]);
     for (int t = 0; t < total_threads; t++)
@@ -705,15 +789,14 @@ int quine_compress(const char *dir_a, const char *dir_b,
     /* Reassemble per-file chunk lists from per-segment lists */
     PreChunkList *b_chunks = reassemble_file_chunks(&segs_b, seg_chunks_b, flb.count);
 
-    /* Free segment data */
-    for (uint32_t i = 0; i < segs_a.count; i++) pcl_free(&seg_chunks_a[i]);
-    free(seg_chunks_a); free(segs_a.s);
+    /* Free segment data (A has no seg_chunks — workers used temp buffers) */
+    free(segs_a.s);
     for (uint32_t i = 0; i < segs_b.count; i++) pcl_free(&seg_chunks_b[i]);
     free(seg_chunks_b); free(segs_b.s);
 
     if (!b_chunks && flb.count) {
         SET_ERR("OOM reassemble"); idx_free(&idx); free(off_b);
-        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+        munmap_all(maps_b, flb.count); goto done;
     }
 
     /* ── 6. Open patch file and write header ── */
@@ -790,7 +873,6 @@ cleanup_all:
     free(off_b);
     for (uint32_t i = 0; i < flb.count; i++) pcl_free(&b_chunks[i]);
     free(b_chunks);
-    munmap_all(maps_a, fla.count);
     munmap_all(maps_b, flb.count);
 
 done:
