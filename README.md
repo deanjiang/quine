@@ -160,7 +160,9 @@ include/quine/quine.h       public header
 src/quine.c                 library implementation
 tests/test.c                test suite
 main.c                      CLI driver
-scripts/verify-roundtrip.sh compress + decompress + compare script
+scripts/
+  verify-roundtrip.sh       compress + decompress + compare
+  benchmark.sh              benchmark quine vs zstd
 Makefile
 build/                      all generated artifacts (gitignored)
 ```
@@ -226,9 +228,9 @@ Byte-compares two directories recursively.  Exits 0 if identical, 1 if they
 differ.  Uses streaming 256 KB chunks — constant memory regardless of file
 sizes.
 
-### Verify round-trip
+### Scripts
 
-A convenience script runs all three steps in sequence, failing on any error:
+**Verify round-trip** — compress, decompress, and compare in sequence:
 
 ```bash
 ./scripts/verify-roundtrip.sh <dir_a> <dir_b> [max_mem]
@@ -239,6 +241,18 @@ A convenience script runs all three steps in sequence, failing on any error:
 - Decompresses the patch (with `--verify-max-mem`)
 - Byte-compares the restored output against dir_b
 - Cleans up temporary files on exit
+- Exits non-zero if any step fails
+
+**Benchmark** — compare quine against zstd with timing, RSS, and compression
+ratio:
+
+```bash
+./scripts/benchmark.sh <dir_a> <dir_b>
+```
+
+Runs quine compress/decompress, zstd standalone (`tar | zstd`), and zstd
+delta (`zstd --patch-from`), then prints a summary table.  Requires `zstd`
+and GNU `time` (`/usr/bin/time -v`).
 
 ---
 
