@@ -156,12 +156,13 @@ sudo apt install -y build-essential libssl-dev
 ## Project layout
 
 ```
-include/quine/quine.h   public header
-src/quine.c             library implementation
-tests/test.c            test suite
-main.c                  CLI driver (convenience tool)
+include/quine/quine.h       public header
+src/quine.c                 library implementation
+tests/test.c                test suite
+main.c                      CLI driver
+scripts/verify-roundtrip.sh compress + decompress + compare script
 Makefile
-build/                  all generated artifacts (gitignored)
+build/                      all generated artifacts (gitignored)
 ```
 
 ## Build
@@ -204,71 +205,40 @@ equivalent.
 build/quine compress <dir_a> <dir_b> <output.patch>
 ```
 
-The CLI shows per-file progress and automatically verifies the patch by
-decompressing to a temporary directory and comparing against dir B.
-
-Example output:
-
-```
-compressing...
-  [scan_a]
-  [scan_b]
-  [index_a] (1/2) src/engine.bin
-  [index_a] (2/2) src/main.c
-  [write_header]
-  [encode_b] (1/3) assets/new.bin
-  [encode_b] (2/3) src/engine.bin
-  [encode_b] (3/3) src/main.c
-
-patch written: /tmp/B.patch
-
-  dir A size:          264.0 KB
-  dir B size:          296.0 KB
-  patch size:          52.0 KB
-  ratio:               5.69x  (82% savings)
-
-  operation:           compress
-  wall time:           0.003 s
-  cpu time:            0.002 s (user)  0.001 s (sys)
-  cores used:          1.00
-  peak RSS:            55260 KB
-
-verifying...
-  [read_header]
-  [restore] (1/3) /tmp/quine_verify_511953/assets/new.bin
-  [restore] (2/3) /tmp/quine_verify_511953/src/engine.bin
-  [restore] (3/3) /tmp/quine_verify_511953/src/main.c
-  OK: round-trip verified
-```
-
 ### Decompress
 
 ```bash
-build/quine decompress <dir_a> <input.patch> <out_dir>
+build/quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>
 ```
 
-`out_dir` is created if it does not exist.
+`out_dir` is created if it does not exist.  The optional `--verify-max-mem`
+flag causes the command to fail if peak RSS exceeds the given limit (e.g.
+`10M`, `512K`, `1G`).  This is useful in CI to enforce the decompressor's
+memory guarantees.
 
-Example output:
+### Compare
 
+```bash
+build/quine compare <dir_a> <dir_b>
 ```
-decompressing...
-  [read_header]
-  [restore] (1/3) /tmp/restored/assets/new.bin
-  [restore] (2/3) /tmp/restored/src/engine.bin
-  [restore] (3/3) /tmp/restored/src/main.c
 
-restored to: /tmp/restored
+Byte-compares two directories recursively.  Exits 0 if identical, 1 if they
+differ.  Uses streaming 256 KB chunks — constant memory regardless of file
+sizes.
 
-  patch size:          52.0 KB
-  output size:         296.0 KB
+### Verify round-trip
 
-  operation:           decompress
-  wall time:           0.003 s
-  cpu time:            0.000 s (user)  0.003 s (sys)
-  cores used:          1.00
-  peak RSS:            5648 KB
+A convenience script runs all three steps in sequence, failing on any error:
+
+```bash
+./scripts/verify-roundtrip.sh <dir_a> <dir_b> [max_mem]
 ```
+
+- `max_mem` defaults to `10M` — the peak RSS limit for decompression
+- Compresses dir_b relative to dir_a
+- Decompresses the patch (with `--verify-max-mem`)
+- Byte-compares the restored output against dir_b
+- Cleans up temporary files on exit
 
 ---
 

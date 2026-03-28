@@ -943,6 +943,49 @@ static void t_lex_order_dedup_direction(void) {
     PASS();
 }
 
+/* ── T22: --verify-max-mem flag ──────────────────────────────────────────── */
+/*
+ * Invokes the CLI binary to test that --verify-max-mem causes decompress
+ * to fail when peak RSS exceeds the limit, and pass when it doesn't.
+ */
+static void t_verify_max_mem(void) {
+    char a[1024], b[1024], p[1024], o1[1024], o2[1024];
+    mkdirs(P(a,sizeof(a),"t22/a"));
+    mkdirs(P(b,sizeof(b),"t22/b"));
+
+    /* Create a small test file */
+    uint8_t data[32*1024];
+    prng_fill(data, sizeof(data), 0x2200);
+    char fb[1024];
+    snprintf(fb,sizeof(fb),"%s/data.bin",b);
+    write_file(fb, data, sizeof(data));
+
+    P(p,sizeof(p),"t22/out.patch");
+    P(o1,sizeof(o1),"t22/out1");
+    P(o2,sizeof(o2),"t22/out2");
+
+    /* Compress */
+    if (quine_compress(a, b, p))
+        FAIL("compress: %s", quine_errmsg());
+
+    /* Decompress with generous limit — should pass */
+    char cmd[4096];
+    snprintf(cmd,sizeof(cmd),
+             "build/quine decompress --verify-max-mem=1G %s %s %s >/dev/null 2>&1",
+             a, p, o1);
+    int rc = system(cmd);
+    if (rc != 0) FAIL("decompress with 1G limit should pass (exit %d)", rc);
+
+    /* Decompress with tiny limit — should fail */
+    snprintf(cmd,sizeof(cmd),
+             "build/quine decompress --verify-max-mem=1K %s %s %s >/dev/null 2>&1",
+             a, p, o2);
+    rc = system(cmd);
+    if (rc == 0) FAIL("decompress with 1K limit should fail but passed");
+
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §4  Test registry and runner
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -971,6 +1014,7 @@ static const Test TESTS[] = {
     { "b_to_earlier_b_dedup",   t_b_to_earlier_b_dedup     },
     { "many_small_b_files",     t_many_small_b_files       },
     { "lex_order_dedup_dir",    t_lex_order_dedup_direction},
+    { "verify_max_mem",         t_verify_max_mem           },
 };
 static const int NTEST = (int)(sizeof(TESTS)/sizeof(TESTS[0]));
 

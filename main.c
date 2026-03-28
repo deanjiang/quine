@@ -1,18 +1,10 @@
 /*
  * main.c — CLI driver for quine
  *
- * Usage:
+ * Commands:
  *   quine compress   <dir_a> <dir_b> <output.patch>
- *   quine decompress <dir_a> <input.patch> <out_dir>
- *
- * After each operation, prints:
- *   - Wall time
- *   - CPU time (user + sys) and effective core utilisation
- *   - Peak RSS (resident set size) in KB
- *   - Input / output sizes and compression ratio (compress only)
- *
- * Compression also runs a verification pass: decompress the patch into a
- * temporary directory and byte-compare against dir_b.
+ *   quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>
+ *   quine compare    <dir_a> <dir_b>
  */
 #include "quine/quine.h"
 
@@ -30,17 +22,8 @@
 
 /* ── Progress callback ─────────────────────────────────────────────────── */
 
-/*
- * Prints step name when it begins, elapsed time when the next step starts.
- * Example output:
- *   [scan_a]                                0.0s
- *   [index] (1/9) big_model.bin            42.3s
- *   [index] (2/9) small.json                0.1s
- *   [encode_b] ...
- */
-
 static struct timespec g_step_start;
-static int             g_step_pending = 0; /* 1 = a line is open, needs elapsed */
+static int             g_step_pending = 0;
 
 static void progress_timer_reset(void) {
     g_step_pending = 0;
@@ -58,11 +41,7 @@ static void progress_finish_line(void) {
 
 static void cli_progress(const quine_progress_t *info, void *ctx) {
     (void)ctx;
-
-    /* finish the previous line with its elapsed time */
     progress_finish_line();
-
-    /* start new line: print step info without newline */
     if (info->file && info->total > 0)
         printf("  [%s] (%u/%u) %s", info->stage, info->current, info->total, info->file);
     else if (info->file)
@@ -70,8 +49,6 @@ static void cli_progress(const quine_progress_t *info, void *ctx) {
     else
         printf("  [%s]", info->stage);
     fflush(stdout);
-
-    /* record start time for this step */
     clock_gettime(CLOCK_MONOTONIC, &g_step_start);
     g_step_pending = 1;
 }
@@ -88,7 +65,6 @@ static void timer_start(Timer *t) {
     getrusage(RUSAGE_SELF, &t->ru_start);
 }
 
-/* Returns wall seconds elapsed since timer_start(). */
 static double timer_wall(const Timer *t) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -96,12 +72,6 @@ static double timer_wall(const Timer *t) {
            (now.tv_nsec - t->wall_start.tv_nsec) * 1e-9;
 }
 
-/*
- * Fills *user_sec and *sys_sec with CPU time consumed since timer_start().
- * cpu_cores is the effective parallelism:  total_cpu_time / wall_time.
- * For a single-threaded program this will be ~1.0 (slightly under due to
- * kernel overhead); a parallel encoder would show > 1.0.
- */
 static void timer_cpu(const Timer *t, double wall_sec,
                        double *user_sec, double *sys_sec, double *cpu_cores) {
     struct rusage ru_now;
@@ -117,12 +87,6 @@ static void timer_cpu(const Timer *t, double wall_sec,
     *cpu_cores = (wall_sec > 1e-6) ? total_cpu / wall_sec : 0.0;
 }
 
-/*
- * Peak RSS (high water mark) from /proc/self/status (Linux).
- * VmHWM is the actual peak physical memory used — unlike VmPeak which
- * includes the full virtual address space (inflated by mmap'd files).
- * Falls back to getrusage() ru_maxrss if the proc file isn't available.
- */
 static long peak_rss_kb(void) {
     FILE *f = fopen("/proc/self/status", "r");
     if (f) {
@@ -136,16 +100,14 @@ static long peak_rss_kb(void) {
         }
         fclose(f);
     }
-    /* fallback */
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
-    return ru.ru_maxrss;   /* already KB on Linux */
+    return ru.ru_maxrss;
 }
 
-/* ── Directory size helper ───────────────────────────────────────────────── */
+/* ── Size helpers ────────────────────────────────────────────────────────── */
 
 static int64_t dir_bytes(const char *root) {
-    /* Iterative walk, same pattern as quine.c */
     #define STACK_MAX 4096
     char **stack = malloc(STACK_MAX * sizeof(char*));
     if (!stack) return -1;
@@ -181,8 +143,6 @@ static int64_t file_bytes(const char *path) {
     return stat(path, &st) == 0 ? st.st_size : -1;
 }
 
-/* ── Formatting helpers ──────────────────────────────────────────────────── */
-
 static void fmt_bytes(char *buf, size_t bufsz, int64_t b) {
     if      (b >= 1024*1024*1024) snprintf(buf, bufsz, "%.2f GB", b / (1024.0*1024*1024));
     else if (b >= 1024*1024)      snprintf(buf, bufsz, "%.2f MB", b / (1024.0*1024));
@@ -200,10 +160,23 @@ static void print_stats(const char *op, double wall, double user, double sys,
     printf("  %-20s %ld KB\n", "peak RSS:",    rss_kb);
 }
 
-/* ── Verification helpers ────────────────────────────────────────────────── */
+/* Parse a size string like "10M", "512K", "1G".  Returns bytes, or -1. */
+static int64_t parse_size(const char *s) {
+    char *end;
+    double val = strtod(s, &end);
+    if (end == s) return -1;
+    switch (*end) {
+        case 'G': case 'g': val *= 1024*1024*1024; break;
+        case 'M': case 'm': val *= 1024*1024; break;
+        case 'K': case 'k': val *= 1024; break;
+        case '\0': case 'B': case 'b': break;
+        default: return -1;
+    }
+    return (int64_t)val;
+}
 
-/* Compare two files byte-for-byte in streaming 256 KB chunks.
- * Returns 1 if identical, 0 otherwise.  Constant memory. */
+/* ── Compare helpers ─────────────────────────────────────────────────────── */
+
 static int files_equal(const char *a, const char *b) {
     struct stat sa, sb;
     if (stat(a, &sa) || stat(b, &sb)) return 0;
@@ -220,7 +193,7 @@ static int files_equal(const char *a, const char *b) {
         ssize_t na = read(fa, bufa, CMP_BUF);
         ssize_t nb = read(fb, bufb, CMP_BUF);
         if (na != nb) { eq = 0; break; }
-        if (na == 0) break;  /* both EOF */
+        if (na == 0) break;
         if (memcmp(bufa, bufb, (size_t)na)) eq = 0;
     }
     close(fa); close(fb);
@@ -228,7 +201,6 @@ static int files_equal(const char *a, const char *b) {
     #undef CMP_BUF
 }
 
-/* Recursively compare two directories; return 1 if identical */
 static int dirs_equal(const char *a, const char *b) {
     DIR *da = opendir(a);
     if (!da) return 0;
@@ -248,13 +220,55 @@ static int dirs_equal(const char *a, const char *b) {
     return ok;
 }
 
-/*
- * Run decompression with progress, timing, and stats.
- * label: stats label (e.g. "decompress" or "verify decompress")
- * Returns 0 on success, 1 on error (prints error to stderr).
- */
-static int run_decompress(const char *dir_a, const char *patch_path,
-                           const char *out_dir, const char *label) {
+/* ── Commands ────────────────────────────────────────────────────────────── */
+
+static int cmd_compress(const char *dir_a, const char *dir_b,
+                         const char *patch_path) {
+    int64_t sz_a = dir_bytes(dir_a);
+    int64_t sz_b = dir_bytes(dir_b);
+
+    Timer t;
+    timer_start(&t);
+    progress_timer_reset();
+
+    printf("compressing...\n");
+    int r = quine_compress(dir_a, dir_b, patch_path);
+    progress_finish_line();
+
+    double wall = timer_wall(&t);
+    double user, sys, cores;
+    timer_cpu(&t, wall, &user, &sys, &cores);
+    long rss = peak_rss_kb();
+
+    if (r) {
+        fprintf(stderr, "compress error: %s\n", quine_errmsg());
+        return 1;
+    }
+
+    int64_t sz_patch = file_bytes(patch_path);
+
+    char ba[32], bb[32], bp[32];
+    fmt_bytes(ba, sizeof(ba), sz_a);
+    fmt_bytes(bb, sizeof(bb), sz_b);
+    fmt_bytes(bp, sizeof(bp), sz_patch);
+
+    printf("\npatch written: %s\n", patch_path);
+    printf("\n");
+    printf("  %-20s %s\n",    "dir A size:",   ba);
+    printf("  %-20s %s\n",    "dir B size:",   bb);
+    printf("  %-20s %s\n",    "patch size:",   bp);
+    if (sz_b > 0 && sz_patch > 0) {
+        printf("  %-20s %.2fx  (%.0f%% savings)\n",
+               "ratio:",
+               (double)sz_b / sz_patch,
+               100.0 * (1.0 - (double)sz_patch / sz_b));
+    }
+    print_stats("compress", wall, user, sys, cores, rss);
+    return 0;
+}
+
+static int cmd_decompress(const char *dir_a, const char *patch_path,
+                            const char *out_dir, int64_t max_mem_kb) {
     int64_t sz_patch = file_bytes(patch_path);
 
     Timer t;
@@ -283,120 +297,85 @@ static int run_decompress(const char *dir_a, const char *patch_path,
 
     printf("\n  %-20s %s\n", "patch size:",  bp);
     printf("  %-20s %s\n",   "output size:", bo);
-    print_stats(label, wall, user, sys, cores, rss);
+    print_stats("decompress", wall, user, sys, cores, rss);
+
+    if (max_mem_kb > 0 && rss > max_mem_kb) {
+        char actual[32], limit[32];
+        fmt_bytes(actual, sizeof(actual), rss * 1024);
+        fmt_bytes(limit,  sizeof(limit),  max_mem_kb * 1024);
+        fprintf(stderr, "\nFAIL: peak RSS %s exceeds --verify-max-mem=%s\n",
+                actual, limit);
+        return 1;
+    }
     return 0;
 }
 
-static void rmtree(const char *path) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    int rc = system(cmd); (void)rc;
+static int cmd_compare(const char *dir_a, const char *dir_b) {
+    Timer t;
+    timer_start(&t);
+
+    printf("comparing %s vs %s ...\n", dir_a, dir_b);
+    int eq = dirs_equal(dir_a, dir_b);
+
+    double wall = timer_wall(&t);
+    double user, sys, cores;
+    timer_cpu(&t, wall, &user, &sys, &cores);
+    long rss = peak_rss_kb();
+    print_stats("compare", wall, user, sys, cores, rss);
+
+    if (eq) {
+        printf("  OK: directories are identical\n");
+        return 0;
+    } else {
+        fprintf(stderr, "  FAIL: directories differ\n");
+        return 1;
+    }
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    if (argc < 2) goto usage;
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage:\n"
+            "  quine compress   <dir_a> <dir_b> <output.patch>\n"
+            "  quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>\n"
+            "  quine compare    <dir_a> <dir_b>\n"
+            "\n"
+            "SIZE examples: 10M, 512K, 1G\n");
+        return 1;
+    }
 
     quine_set_progress(cli_progress, NULL);
 
-    /* ── compress ── */
-    if (!strcmp(argv[1], "compress") && argc == 5) {
-        const char *dir_a      = argv[2];
-        const char *dir_b      = argv[3];
-        const char *patch_path = argv[4];
+    if (!strcmp(argv[1], "compress") && argc == 5)
+        return cmd_compress(argv[2], argv[3], argv[4]);
 
-        int64_t sz_a = dir_bytes(dir_a);
-        int64_t sz_b = dir_bytes(dir_b);
+    if (!strcmp(argv[1], "decompress")) {
+        int64_t max_mem_kb = -1;
+        int argi = 2;
 
-        Timer t;
-        timer_start(&t);
-        progress_timer_reset();
-
-        printf("compressing...\n");
-        int r = quine_compress(dir_a, dir_b, patch_path);
-        progress_finish_line();
-
-        double wall = timer_wall(&t);
-        double user, sys, cores;
-        timer_cpu(&t, wall, &user, &sys, &cores);
-        long rss = peak_rss_kb();
-
-        if (r) {
-            fprintf(stderr, "compress error: %s\n", quine_errmsg());
-            return 1;
-        }
-
-        int64_t sz_patch = file_bytes(patch_path);
-
-        char ba[32], bb[32], bp[32];
-        fmt_bytes(ba, sizeof(ba), sz_a);
-        fmt_bytes(bb, sizeof(bb), sz_b);
-        fmt_bytes(bp, sizeof(bp), sz_patch);
-
-        printf("\npatch written: %s\n", patch_path);
-        printf("\n");
-        printf("  %-20s %s\n",    "dir A size:",   ba);
-        printf("  %-20s %s\n",    "dir B size:",   bb);
-        printf("  %-20s %s\n",    "patch size:",   bp);
-        if (sz_b > 0 && sz_patch > 0) {
-            printf("  %-20s %.2fx  (%.0f%% savings)\n",
-                   "ratio:",
-                   (double)sz_b / sz_patch,
-                   100.0 * (1.0 - (double)sz_patch / sz_b));
-        }
-        print_stats("compress", wall, user, sys, cores, rss);
-
-        /* ── verify: decompress then compare ── */
-        char tmpdir[256];
-        snprintf(tmpdir, sizeof(tmpdir), "/tmp/quine_verify_%d", (int)getpid());
-
-        /* step 1: decompress */
-        printf("\nverify: ");
-        if (run_decompress(dir_a, patch_path, tmpdir, "verify decompress")) {
-            rmtree(tmpdir);
-            return 1;
-        }
-
-        /* step 2: byte-compare */
-        printf("\nverify: comparing...\n");
-        {
-            Timer tc;
-            timer_start(&tc);
-
-            int eq = dirs_equal(dir_b, tmpdir);
-
-            double cwall = timer_wall(&tc);
-            double cuser, csys, ccores;
-            timer_cpu(&tc, cwall, &cuser, &csys, &ccores);
-            long crss = peak_rss_kb();
-            print_stats("verify compare", cwall, cuser, csys, ccores, crss);
-
-            if (eq) {
-                printf("  OK: round-trip verified\n");
-            } else {
-                fprintf(stderr, "  FAIL: decompressed output differs from dir B\n");
-                rmtree(tmpdir);
+        /* parse optional --verify-max-mem=SIZE */
+        if (argi < argc && !strncmp(argv[argi], "--verify-max-mem=", 17)) {
+            int64_t bytes = parse_size(argv[argi] + 17);
+            if (bytes < 0) {
+                fprintf(stderr, "invalid --verify-max-mem value: %s\n", argv[argi] + 17);
                 return 1;
             }
+            max_mem_kb = bytes / 1024;
+            argi++;
         }
-        rmtree(tmpdir);
-        return 0;
+
+        if (argc - argi != 3) {
+            fprintf(stderr, "Usage: quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>\n");
+            return 1;
+        }
+        return cmd_decompress(argv[argi], argv[argi+1], argv[argi+2], max_mem_kb);
     }
 
-    /* ── decompress ── */
-    if (!strcmp(argv[1], "decompress") && argc == 5) {
-        const char *dir_a      = argv[2];
-        const char *patch_path = argv[3];
-        const char *out_dir    = argv[4];
+    if (!strcmp(argv[1], "compare") && argc == 4)
+        return cmd_compare(argv[2], argv[3]);
 
-        return run_decompress(dir_a, patch_path, out_dir, "decompress");
-    }
-
-usage:
-    fprintf(stderr,
-        "Usage:\n"
-        "  quine compress   <dir_a> <dir_b> <output.patch>\n"
-        "  quine decompress <dir_a> <input.patch> <out_dir>\n");
+    fprintf(stderr, "Unknown command: %s\n", argv[1]);
     return 1;
 }
