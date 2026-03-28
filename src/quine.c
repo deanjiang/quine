@@ -851,21 +851,121 @@ static void st_free(SlotTable *t) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §9  Patch reader helpers
+ * §9  Buffered patch reader (fd-based, no mmap)
+ *
+ * Reads the patch via read() with a 4 MB buffer.  Keeps RSS low —
+ * only the buffer is resident, not the entire patch file.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-typedef struct { const uint8_t *base; size_t size, pos; } PR;
+#define PR_BUF (4u * 1024 * 1024)
 
-static int pr_need(PR *r, size_t n) {
-    if (r->pos + n > r->size) {
-        SET_ERR("patch truncated at %zu", r->pos); return -1;
+typedef struct {
+    int      fd;
+    uint8_t *buf;
+    size_t   buf_pos;   /* next byte to consume in buf */
+    size_t   buf_len;   /* valid bytes in buf           */
+    uint64_t file_pos;  /* absolute position in file    */
+    uint64_t file_size;
+} PR;
+
+static int pr_init(PR *r, int fd) {
+    struct stat st;
+    if (fstat(fd, &st)) return -1;
+    r->fd        = fd;
+    r->buf       = malloc(PR_BUF);
+    r->buf_pos   = 0;
+    r->buf_len   = 0;
+    r->file_pos  = 0;
+    r->file_size = (uint64_t)st.st_size;
+    return r->buf ? 0 : -1;
+}
+
+static void pr_free(PR *r) { free(r->buf); r->buf = NULL; }
+
+/* Refill buffer from fd. */
+static int pr_refill(PR *r) {
+    if (r->buf_pos < r->buf_len) {
+        /* move remaining bytes to front */
+        size_t rem = r->buf_len - r->buf_pos;
+        memmove(r->buf, r->buf + r->buf_pos, rem);
+        r->buf_len = rem;
+    } else {
+        r->buf_len = 0;
+    }
+    r->buf_pos = 0;
+    size_t want = PR_BUF - r->buf_len;
+    if (want) {
+        ssize_t got = read(r->fd, r->buf + r->buf_len, want);
+        if (got > 0) r->buf_len += (size_t)got;
     }
     return 0;
 }
+
 static int pr_read(PR *r, void *d, size_t n) {
-    if (pr_need(r,n)) return -1;
-    memcpy(d, r->base + r->pos, n); r->pos += n; return 0;
+    uint8_t *dst = d;
+    while (n) {
+        if (r->buf_pos >= r->buf_len) {
+            pr_refill(r);
+            if (r->buf_pos >= r->buf_len) {
+                SET_ERR("patch truncated at %llu",
+                        (unsigned long long)r->file_pos);
+                return -1;
+            }
+        }
+        size_t avail = r->buf_len - r->buf_pos;
+        size_t take  = n < avail ? n : avail;
+        memcpy(dst, r->buf + r->buf_pos, take);
+        r->buf_pos += take;
+        r->file_pos += take;
+        dst += take;
+        n -= take;
+    }
+    return 0;
 }
+
+/* Skip n bytes without copying. */
+static int pr_skip(PR *r, size_t n) {
+    while (n) {
+        if (r->buf_pos >= r->buf_len) {
+            pr_refill(r);
+            if (r->buf_pos >= r->buf_len) {
+                SET_ERR("patch truncated"); return -1;
+            }
+        }
+        size_t avail = r->buf_len - r->buf_pos;
+        size_t take  = n < avail ? n : avail;
+        r->buf_pos += take;
+        r->file_pos += take;
+        n -= take;
+    }
+    return 0;
+}
+
+/*
+ * Write n bytes from the patch directly to out_fd without intermediate
+ * buffer copy.  Reads from patch buffer (or refills) in chunks and
+ * writes directly to the output.
+ */
+static int pr_write_to(PR *r, int out_fd, size_t n) {
+    while (n) {
+        if (r->buf_pos >= r->buf_len) {
+            pr_refill(r);
+            if (r->buf_pos >= r->buf_len) {
+                SET_ERR("patch truncated"); return -1;
+            }
+        }
+        size_t avail = r->buf_len - r->buf_pos;
+        size_t take  = n < avail ? n : avail;
+        if (write(out_fd, r->buf + r->buf_pos, take) != (ssize_t)take) {
+            SET_ERR("write lit: %s", strerror(errno)); return -1;
+        }
+        r->buf_pos += take;
+        r->file_pos += take;
+        n -= take;
+    }
+    return 0;
+}
+
 static int pr_u8 (PR *r, uint8_t  *v) { return pr_read(r,v,1); }
 static int pr_u16(PR *r, uint16_t *v) {
     uint8_t b[2]; if (pr_read(r,b,2)) return -1;
@@ -900,166 +1000,184 @@ int quine_decompress(const char *dir_a,
                         const char *out_dir) {
     int ret = -1;
 
-    int pfd = open(patch_path, O_RDONLY);
-    if (pfd < 0) { SET_ERR("open patch: %s", strerror(errno)); return -1; }
-    struct stat pst; fstat(pfd, &pst);
-    const uint8_t *pmem = mmap(NULL, pst.st_size,
-                                PROT_READ, MAP_PRIVATE, pfd, 0);
-    close(pfd);
-    if (pmem == MAP_FAILED) { SET_ERR("mmap patch"); return -1; }
-    madvise((void*)pmem, pst.st_size, MADV_SEQUENTIAL);
+    /* All resources declared upfront with safe defaults.
+     * Cleanup at the bottom is always safe regardless of where we stop. */
+    int          pfd     = -1;
+    PR           r       = {0};   /* buf=NULL → pr_free is safe */
+    SlotTable    st      = {0};
+    char       **b_paths = NULL;
+    uint64_t    *b_sizes = NULL;
+    uint8_t     *copybuf = NULL;
+    int          out_fd  = -1;
+    uint16_t     b_count = 0;
+    uint16_t     a_count = 0;
 
-    PR r = { pmem, (size_t)pst.st_size, 0 };
+    do {
+        pfd = open(patch_path, O_RDONLY);
+        if (pfd < 0) { SET_ERR("open patch: %s", strerror(errno)); break; }
 
-    progress("read_header", NULL, 0, 0);
-    {
-        uint8_t magic[4]; pr_read(&r, magic, 4);
-        if (memcmp(magic, QN_MAGIC, 4)) {
-            SET_ERR("bad magic"); goto out_unmap;
-        }
-        uint8_t ver; pr_u8(&r, &ver);
+        if (pr_init(&r, pfd)) { SET_ERR("init patch reader"); break; }
+
+        /* ── header ── */
+        progress("read_header", NULL, 0, 0);
+
+        uint8_t magic[4];
+        if (pr_read(&r, magic, 4)) break;
+        if (memcmp(magic, QN_MAGIC, 4)) { SET_ERR("bad magic"); break; }
+
+        uint8_t ver;
+        if (pr_u8(&r, &ver)) break;
         if (ver != QN_VERSION) {
             SET_ERR("version mismatch (got %u want %u)", ver, QN_VERSION);
-            goto out_unmap;
-        }
-    }
-    uint32_t cmin, cavg, cmax;
-    pr_u32(&r,&cmin); pr_u32(&r,&cavg); pr_u32(&r,&cmax);
-
-    SlotTable st = {0};
-    uint64_t flat_pos = 0;
-
-    uint16_t a_count = 0; pr_u16(&r, &a_count);
-    for (uint16_t i = 0; i < a_count; i++) {
-        uint16_t plen = 0; pr_u16(&r, &plen);
-        if (pr_need(&r, plen)) goto out_slots;
-        char abs[4096];
-        int n = snprintf(abs, sizeof(abs), "%s/", dir_a);
-        if (n + plen + 1 > (int)sizeof(abs)) {
-            SET_ERR("A path too long"); goto out_slots;
-        }
-        memcpy(abs + n, r.base + r.pos, plen);
-        abs[n + plen] = '\0';
-        r.pos += plen;
-        uint64_t sz = 0; pr_u64(&r, &sz);
-        int fd = open(abs, O_RDONLY);
-        st_add(&st, flat_pos, sz, fd);
-        flat_pos += sz;
-    }
-    uint64_t a_total = flat_pos;
-
-    uint16_t b_count = 0; pr_u16(&r, &b_count);
-    char    **b_paths = calloc(b_count, sizeof(char*));
-    uint64_t *b_sizes = calloc(b_count, sizeof(uint64_t));
-    if (!b_paths || !b_sizes) { SET_ERR("OOM"); goto out_slots; }
-
-    flat_pos = a_total;
-    for (uint16_t i = 0; i < b_count; i++) {
-        uint16_t plen = 0; pr_u16(&r, &plen);
-        if (pr_need(&r, plen)) goto out_binfo;
-        char *rel = malloc(plen + 1);
-        if (!rel) { SET_ERR("OOM"); goto out_binfo; }
-        memcpy(rel, r.base + r.pos, plen); rel[plen] = '\0';
-        r.pos += plen;
-        uint64_t sz = 0; pr_u64(&r, &sz);
-        char abs[4096];
-        snprintf(abs, sizeof(abs), "%s/%s", out_dir, rel);
-        free(rel);
-        b_paths[i] = strdup(abs);
-        b_sizes[i] = sz;
-        st_add(&st, flat_pos, sz, -1);
-        flat_pos += sz;
-    }
-
-    { char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",out_dir); mkdirp(tmp); }
-
-    uint8_t *copybuf = malloc(cmax);
-    if (!copybuf) { SET_ERR("OOM copybuf"); goto out_binfo; }
-
-    int      out_fd   = -1;
-    int      out_rd   = -1;
-    uint16_t b_idx    = 0;
-    int      slot_idx = (int)a_count;
-
-    while (1) {
-        uint8_t op;
-        if (pr_u8(&r, &op)) goto out_copy;
-        if (op == QN_OP_END) break;
-
-        if (op == QN_OP_NEWFILE) {
-            if (out_fd >= 0) { close(out_fd); out_fd = -1; out_rd = -1; }
-            uint16_t plen = 0; pr_u16(&r, &plen);
-            if (pr_need(&r, plen)) goto out_copy;
-            r.pos += plen;
-            const char *outpath = b_paths[b_idx];
-            char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",outpath);
-            char *sl = strrchr(tmp,'/');
-            if (sl && sl != tmp) { *sl='\0'; mkdirp(tmp); }
-            out_fd = open(outpath, O_CREAT|O_WRONLY|O_TRUNC, 0644);
-            if (out_fd < 0) {
-                SET_ERR("open output %s: %s", outpath, strerror(errno));
-                goto out_copy;
-            }
-            out_rd = open(outpath, O_RDONLY);
-            if (out_rd < 0) {
-                SET_ERR("open read-fd %s: %s", outpath, strerror(errno));
-                goto out_copy;
-            }
-            slot_idx = (int)a_count + (int)b_idx;
-            st.s[slot_idx].fd = out_rd;
-            b_idx++;
-            progress("restore", b_paths[b_idx - 1], b_idx, b_count);
-            continue;
+            break;
         }
 
-        if (op == QN_OP_REF) {
-            uint64_t off; uint32_t len;
-            if (pr_u64(&r,&off) || pr_u32(&r,&len)) goto out_copy;
-            if (out_fd < 0) { SET_ERR("REF before NEWFILE"); goto out_copy; }
-            if (len > cmax)  { SET_ERR("REF len %u > chunk_max", len); goto out_copy; }
-            int src_fd; uint64_t local_off;
-            if (st_resolve(&st, off, &src_fd, &local_off)) {
-                SET_ERR("REF offset %llu not in slot table",
-                        (unsigned long long)off);
-                goto out_copy;
+        uint32_t cmin, cavg, cmax;
+        if (pr_u32(&r,&cmin) || pr_u32(&r,&cavg) || pr_u32(&r,&cmax)) break;
+
+        /* ── A manifest ── */
+        uint64_t flat_pos = 0;
+        if (pr_u16(&r, &a_count)) break;
+
+        int ok = 1;
+        for (uint16_t i = 0; i < a_count && ok; i++) {
+            uint16_t plen = 0;
+            if (pr_u16(&r, &plen)) { ok = 0; break; }
+            char abs[4096];
+            int n = snprintf(abs, sizeof(abs), "%s/", dir_a);
+            if (n + plen + 1 > (int)sizeof(abs)) {
+                SET_ERR("A path too long"); ok = 0; break;
             }
-            ssize_t got = pread(src_fd, copybuf, len, (off_t)local_off);
-            if (got != (ssize_t)len) {
-                SET_ERR("pread at global %llu: got %zd expected %u",
-                        (unsigned long long)off, got, len);
-                goto out_copy;
-            }
-            if (write(out_fd, copybuf, len) != (ssize_t)len) {
-                SET_ERR("write: %s", strerror(errno)); goto out_copy;
-            }
-            continue;
+            if (pr_read(&r, abs + n, plen)) { ok = 0; break; }
+            abs[n + plen] = '\0';
+            uint64_t sz = 0;
+            if (pr_u64(&r, &sz)) { ok = 0; break; }
+            int fd = open(abs, O_RDONLY);
+            st_add(&st, flat_pos, sz, fd);
+            flat_pos += sz;
         }
+        if (!ok) break;
+        uint64_t a_total = flat_pos;
 
-        if (op == QN_OP_LIT) {
-            uint32_t len; pr_u32(&r,&len);
-            if (pr_need(&r,len)) goto out_copy;
-            if (out_fd < 0) { SET_ERR("LIT before NEWFILE"); goto out_copy; }
-            if (write(out_fd, r.base + r.pos, len) != (ssize_t)len) {
-                SET_ERR("write lit: %s", strerror(errno)); goto out_copy;
-            }
-            r.pos += len;
-            continue;
+        /* ── B manifest ── */
+        if (pr_u16(&r, &b_count)) break;
+        b_paths = calloc(b_count, sizeof(char*));
+        b_sizes = calloc(b_count, sizeof(uint64_t));
+        if (!b_paths || !b_sizes) { SET_ERR("OOM"); break; }
+
+        flat_pos = a_total;
+        for (uint16_t i = 0; i < b_count && ok; i++) {
+            uint16_t plen = 0;
+            if (pr_u16(&r, &plen)) { ok = 0; break; }
+            char *rel = malloc(plen + 1);
+            if (!rel) { SET_ERR("OOM"); ok = 0; break; }
+            if (pr_read(&r, rel, plen)) { free(rel); ok = 0; break; }
+            rel[plen] = '\0';
+            uint64_t sz = 0;
+            if (pr_u64(&r, &sz)) { free(rel); ok = 0; break; }
+            char abs[4096];
+            snprintf(abs, sizeof(abs), "%s/%s", out_dir, rel);
+            free(rel);
+            b_paths[i] = strdup(abs);
+            b_sizes[i] = sz;
+            st_add(&st, flat_pos, sz, -1);
+            flat_pos += sz;
         }
+        if (!ok) break;
 
-        SET_ERR("unknown opcode 0x%02x at %zu", op, r.pos-1);
-        goto out_copy;
-    }
-    ret = 0;
+        { char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",out_dir); mkdirp(tmp); }
 
-out_copy:
+        copybuf = malloc(cmax);
+        if (!copybuf) { SET_ERR("OOM copybuf"); break; }
+
+        /* ── opcode loop ── */
+        uint16_t b_idx = 0;
+
+        while (ok) {
+            uint8_t op;
+            if (pr_u8(&r, &op)) { ok = 0; break; }
+            if (op == QN_OP_END) break;
+
+            if (op == QN_OP_NEWFILE) {
+                if (out_fd >= 0) { close(out_fd); out_fd = -1; }
+
+                uint16_t plen = 0;
+                if (pr_u16(&r, &plen) || pr_skip(&r, plen)) { ok = 0; break; }
+
+                const char *outpath = b_paths[b_idx];
+                char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",outpath);
+                char *sl = strrchr(tmp,'/');
+                if (sl && sl != tmp) { *sl='\0'; mkdirp(tmp); }
+
+                out_fd = open(outpath, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+                if (out_fd < 0) {
+                    SET_ERR("open output %s: %s", outpath, strerror(errno));
+                    ok = 0; break;
+                }
+
+                int out_rd = open(outpath, O_RDONLY);
+                if (out_rd < 0) {
+                    SET_ERR("open read-fd %s: %s", outpath, strerror(errno));
+                    ok = 0; break;
+                }
+
+                int slot_idx = (int)a_count + (int)b_idx;
+                st.s[slot_idx].fd = out_rd;
+
+                b_idx++;
+                progress("restore", b_paths[b_idx - 1], b_idx, b_count);
+                continue;
+            }
+
+            if (op == QN_OP_REF) {
+                uint64_t off; uint32_t len;
+                if (pr_u64(&r,&off) || pr_u32(&r,&len)) { ok = 0; break; }
+                if (out_fd < 0) { SET_ERR("REF before NEWFILE"); ok = 0; break; }
+                if (len > cmax) { SET_ERR("REF len %u > chunk_max", len); ok = 0; break; }
+
+                int src_fd; uint64_t local_off;
+                if (st_resolve(&st, off, &src_fd, &local_off)) {
+                    SET_ERR("REF offset %llu not in slot table",
+                            (unsigned long long)off);
+                    ok = 0; break;
+                }
+                ssize_t got = pread(src_fd, copybuf, len, (off_t)local_off);
+                if (got != (ssize_t)len) {
+                    SET_ERR("pread at global %llu: got %zd expected %u",
+                            (unsigned long long)off, got, len);
+                    ok = 0; break;
+                }
+                if (write(out_fd, copybuf, len) != (ssize_t)len) {
+                    SET_ERR("write: %s", strerror(errno)); ok = 0; break;
+                }
+                continue;
+            }
+
+            if (op == QN_OP_LIT) {
+                uint32_t len;
+                if (pr_u32(&r,&len)) { ok = 0; break; }
+                if (out_fd < 0) { SET_ERR("LIT before NEWFILE"); ok = 0; break; }
+                if (pr_write_to(&r, out_fd, len)) { ok = 0; break; }
+                continue;
+            }
+
+            SET_ERR("unknown opcode 0x%02x at %llu", op,
+                    (unsigned long long)(r.file_pos - 1));
+            ok = 0;
+        }
+        if (!ok) break;
+
+        ret = 0;
+    } while (0);
+
+    /* cleanup — all safe with NULL / -1 / zero-count defaults */
     free(copybuf);
     if (out_fd >= 0) close(out_fd);
-out_binfo:
     for (uint16_t i = 0; i < b_count; i++) free(b_paths[i]);
-    free(b_paths); free(b_sizes);
-out_slots:
+    free(b_paths);
+    free(b_sizes);
     st_free(&st);
-out_unmap:
-    munmap((void*)pmem, pst.st_size);
+    pr_free(&r);
+    if (pfd >= 0) close(pfd);
     return ret;
 }
