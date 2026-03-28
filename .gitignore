@@ -1,9 +1,5 @@
 # Build outputs
 build/
-/quine
-/test_quine
-libquine.a
-libquine.so
 
 # Test artifacts
 /tmp/quine_test_*/

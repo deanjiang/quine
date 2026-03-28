@@ -4,7 +4,6 @@
  * See quine.h for the full algorithm description.
  *
  * Platform: Linux/POSIX.
- * Build:    cc -O2 -D_GNU_SOURCE -o quine quine.c main.c -lssl -lcrypto
  */
 
 #include "quine/quine.h"
@@ -20,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <openssl/sha.h>
 
 /* ── Error state (thread-local) ──────────────────────────────────────────── */
@@ -48,11 +48,6 @@ static void progress(const char *stage, const char *file,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §1  Rabin rolling hash CDC
- *
- * The 48-byte window slides one byte at a time.  At each position we compute
- * a 64-bit hash over the window contents.  When the low 14 bits are zero we
- * declare a chunk boundary (average spacing ~16 KB).  Hard min/max clamps
- * prevent degenerate tiny or huge chunks on pathological inputs.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define RABIN_POLY   0xbfe6b8a5bf378d83ULL
@@ -76,7 +71,7 @@ typedef struct {
     uint8_t  win[QN_RABIN_WINDOW];
     int      wpos;
     uint64_t hash;
-    uint32_t len;       /* bytes since last boundary */
+    uint32_t len;
 } Rabin;
 
 static void rabin_reset(Rabin *r) {
@@ -84,7 +79,6 @@ static void rabin_reset(Rabin *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* Returns 1 if byte b completes a chunk boundary. */
 static inline int rabin_roll(Rabin *r, uint8_t b) {
     r->hash ^= g_rabin_table[r->win[r->wpos]];
     r->win[r->wpos] = b;
@@ -102,8 +96,8 @@ static inline int rabin_roll(Rabin *r, uint8_t b) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    char    *rel;       /* relative path (heap-allocated) */
-    uint64_t size;      /* original file size in bytes    */
+    char    *rel;
+    uint64_t size;
 } FileEntry;
 
 typedef struct {
@@ -135,9 +129,7 @@ static int fe_cmp(const void *a, const void *b) {
     return strcmp(((const FileEntry*)a)->rel, ((const FileEntry*)b)->rel);
 }
 
-/* Collect all regular files under root into fl, then sort lexicographically. */
 static int collect_files(const char *root, FileList *fl) {
-    /* iterative walk with explicit stack */
     char **stack = malloc(4096 * sizeof(char*));
     if (!stack) return -1;
     int top = 0;
@@ -175,23 +167,111 @@ static int collect_files(const char *root, FileList *fl) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §3  Chunk index — sha256 → global_offset (compression side only)
- *
- * Open-addressed hash table.  Key = SHA-256[0..31].
- * Value = global offset in the unified flat address space.
- *
- * Note: len == 0 is used as the "empty bucket" sentinel.  Zero-length chunks
- * are never inserted (CDC min is 4 KB).
+ * §2b  Mmap table
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define IDX_INIT_CAP  (1u << 20)    /* 1M buckets (~64 MB) */
+typedef struct {
+    const uint8_t *data;
+    size_t         size;
+} MmapFile;
+
+static MmapFile *mmap_all(const char *root, const FileList *fl, int prefetch) {
+    MmapFile *maps = calloc(fl->count, sizeof(MmapFile));
+    if (!maps) return NULL;
+    for (uint32_t i = 0; i < fl->count; i++) {
+        char abs[4096];
+        snprintf(abs, sizeof(abs), "%s/%s", root, fl->e[i].rel);
+        int fd = open(abs, O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st;
+        fstat(fd, &st);
+        if (st.st_size == 0) { close(fd); continue; }
+        const uint8_t *p = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (p == MAP_FAILED) continue;
+        madvise((void*)p, st.st_size, MADV_SEQUENTIAL);
+        if (prefetch)
+            madvise((void*)p, st.st_size, MADV_WILLNEED);
+        maps[i].data = p;
+        maps[i].size = (size_t)st.st_size;
+    }
+    return maps;
+}
+
+static void munmap_all(MmapFile *maps, uint32_t count) {
+    if (!maps) return;
+    for (uint32_t i = 0; i < count; i++)
+        if (maps[i].data) munmap((void*)maps[i].data, maps[i].size);
+    free(maps);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §2c  Pre-computed chunk list
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint64_t file_offset;
+    uint32_t len;
+    uint8_t  sha[32];
+} PreChunk;
+
+typedef struct {
+    PreChunk *c;
+    uint32_t  count;
+    uint32_t  cap;
+} PreChunkList;
+
+static void pcl_free(PreChunkList *l) { free(l->c); l->c = NULL; l->count = l->cap = 0; }
+
+static int pcl_add(PreChunkList *l, uint64_t off, uint32_t len, const uint8_t *sha) {
+    if (l->count == l->cap) {
+        uint32_t nc = l->cap ? l->cap * 2 : 64;
+        PreChunk *n = realloc(l->c, nc * sizeof(PreChunk));
+        if (!n) return -1;
+        l->c = n; l->cap = nc;
+    }
+    l->c[l->count].file_offset = off;
+    l->c[l->count].len         = len;
+    memcpy(l->c[l->count].sha, sha, 32);
+    l->count++;
+    return 0;
+}
+
+/*
+ * CDC + SHA-256 a byte range, storing results in pcl.
+ * base_offset is added to each chunk's file_offset (for mid-file segments).
+ */
+static void chunk_range(const uint8_t *data, size_t size,
+                         uint64_t base_offset, PreChunkList *pcl) {
+    if (!data || size == 0) return;
+
+    Rabin r; rabin_reset(&r);
+    size_t chunk_start = 0;
+
+    for (size_t i = 0; i < size; i++) {
+        if (rabin_roll(&r, data[i]) || i == size - 1) {
+            uint32_t clen = (uint32_t)(i - chunk_start + 1);
+            uint8_t  sha[32];
+            SHA256(data + chunk_start, clen, sha);
+            pcl_add(pcl, base_offset + chunk_start, clen, sha);
+            chunk_start = i + 1;
+            rabin_reset(&r);
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * §3  Chunk index
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define IDX_INIT_CAP  (1u << 20)
 #define IDX_LOAD_NUM  3
-#define IDX_LOAD_DEN  4             /* rehash at 75% load  */
+#define IDX_LOAD_DEN  4
 
 typedef struct {
     uint8_t  sha[32];
     uint64_t global_offset;
-    uint32_t len;           /* 0 = empty */
+    uint32_t len;
 } IdxEntry;
 
 typedef struct {
@@ -200,8 +280,10 @@ typedef struct {
     size_t    count;
 } ChunkIdx;
 
-static int idx_init(ChunkIdx *x) {
-    x->cap   = IDX_INIT_CAP;
+static int idx_init_cap(ChunkIdx *x, size_t hint) {
+    size_t cap = IDX_INIT_CAP;
+    while (cap < hint) cap *= 2;
+    x->cap   = cap;
     x->count = 0;
     x->b     = calloc(x->cap, sizeof(IdxEntry));
     return x->b ? 0 : -1;
@@ -229,11 +311,6 @@ static int idx_rehash(ChunkIdx *x) {
     return 0;
 }
 
-/*
- * Insert sha → (global_offset, len).
- * Skips duplicates (same sha already present).
- * Returns 0 ok, -1 OOM.
- */
 static int idx_insert(ChunkIdx *x, const uint8_t *sha,
                        uint64_t global_offset, uint32_t len) {
     if (x->count * IDX_LOAD_DEN >= x->cap * IDX_LOAD_NUM)
@@ -250,14 +327,29 @@ static int idx_insert(ChunkIdx *x, const uint8_t *sha,
     return 0;
 }
 
-/* Returns pointer to entry or NULL. */
-static const IdxEntry *idx_lookup(const ChunkIdx *x, const uint8_t *sha) {
+static const IdxEntry *idx_lookup_before(const ChunkIdx *x,
+                                          const uint8_t *sha,
+                                          uint64_t max_end) {
     size_t i = idx_slot(sha, x->cap);
     while (x->b[i].len) {
-        if (!memcmp(x->b[i].sha, sha, 32)) return &x->b[i];
+        if (!memcmp(x->b[i].sha, sha, 32)) {
+            if (x->b[i].global_offset + x->b[i].len <= max_end)
+                return &x->b[i];
+            return NULL;
+        }
         i = (i + 1) & (x->cap - 1);
     }
     return NULL;
+}
+
+static int idx_merge(ChunkIdx *dst, const ChunkIdx *src) {
+    for (size_t i = 0; i < src->cap; i++) {
+        if (!src->b[i].len) continue;
+        if (idx_insert(dst, src->b[i].sha,
+                        src->b[i].global_offset, src->b[i].len))
+            return -1;
+    }
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -301,140 +393,196 @@ static int pw_u64(PW *w, uint64_t v) {
 static int pw_close(PW *w) { pw_flush(w); return fclose(w->f); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §5  Index one file into the chunk index
+ * §5  Segment-based parallel indexing
  *
- * mmap the file, slide the Rabin window, SHA-256 each chunk, insert into idx
- * at global_base + chunk_start.
+ * Files are split into segments of ~(total_bytes / nproc) each.  Large
+ * files get multiple segments; small files are one segment.  This ensures
+ * all cores stay busy even with few large files.
+ *
+ * CDC restarts at each segment boundary, so chunk boundaries at splits
+ * may differ from serial processing — negligible dedup loss for large files.
+ *
+ * A segments only produce an index.  B segments also store pre-computed
+ * chunk lists (PreChunkList) for the sequential encode phase.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int index_file(ChunkIdx *idx, const char *abs_path,
-                       uint64_t global_base) {
-    int fd = open(abs_path, O_RDONLY);
-    if (fd < 0) return 0;               /* skip unreadable */
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { close(fd); return 0; }
+typedef struct {
+    uint32_t file_idx;
+    uint64_t file_start;    /* byte offset within file */
+    uint64_t file_end;      /* exclusive */
+    uint32_t seg_idx;       /* sequential index within this file's segments */
+} Segment;
 
-    const uint8_t *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (data == MAP_FAILED) return 0;
-    madvise((void*)data, st.st_size, MADV_SEQUENTIAL);
+typedef struct {
+    Segment *s;
+    uint32_t count;
+    uint32_t cap;
+} SegList;
 
-    Rabin r; rabin_reset(&r);
-    size_t chunk_start = 0;
+static int seg_add(SegList *sl, uint32_t fi, uint64_t start, uint64_t end, uint32_t si) {
+    if (sl->count == sl->cap) {
+        uint32_t nc = sl->cap ? sl->cap * 2 : 64;
+        Segment *n = realloc(sl->s, nc * sizeof(Segment));
+        if (!n) return -1;
+        sl->s = n; sl->cap = nc;
+    }
+    sl->s[sl->count++] = (Segment){ fi, start, end, si };
+    return 0;
+}
 
-    for (size_t i = 0; i < (size_t)st.st_size; i++) {
-        if (rabin_roll(&r, data[i]) || i == (size_t)st.st_size - 1) {
-            uint32_t clen = (uint32_t)(i - chunk_start + 1);
-            uint8_t  sha[32];
-            SHA256(data + chunk_start, clen, sha);
-            idx_insert(idx, sha, global_base + chunk_start, clen);
-            chunk_start = i + 1;
-            rabin_reset(&r);
+/*
+ * Build segments from files, splitting any file larger than seg_size.
+ * seg_size = total_bytes / nproc (minimum 1 MB to avoid excessive splits).
+ */
+#define MIN_SEG_SIZE (1u * 1024 * 1024)
+
+static SegList build_segments(const MmapFile *maps, uint32_t count, int nthreads) {
+    SegList sl = {0};
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; i++)
+        total += maps[i].size;
+
+    uint64_t target = total / (uint64_t)nthreads;
+    if (target < MIN_SEG_SIZE) target = MIN_SEG_SIZE;
+
+    for (uint32_t i = 0; i < count; i++) {
+        size_t fsz = maps[i].size;
+        if (fsz == 0) continue;
+        uint64_t off = 0;
+        uint32_t si = 0;
+        while (off < (uint64_t)fsz) {
+            uint64_t end = off + target;
+            if (end > (uint64_t)fsz || (uint64_t)fsz - end < MIN_SEG_SIZE)
+                end = (uint64_t)fsz;  /* don't leave a tiny tail */
+            seg_add(&sl, i, off, end, si++);
+            off = end;
         }
     }
-    munmap((void*)data, st.st_size);
-    return 0;
+    return sl;
+}
+
+/* Per-segment output: a PreChunkList.  Array is indexed by segment index
+ * in the SegList and filled by the owning worker thread. */
+
+typedef struct {
+    /* inputs */
+    const MmapFile *maps;
+    const uint64_t *offsets;        /* global offset per file */
+    const Segment  *segs;           /* segment array (shared, read-only) */
+    uint32_t        seg_start;      /* first segment index for this thread */
+    uint32_t        seg_end;        /* exclusive */
+    PreChunkList   *seg_chunks;     /* output: one PreChunkList per segment */
+    /* output */
+    ChunkIdx        idx;
+} SegWork;
+
+static void *seg_worker(void *arg) {
+    SegWork *w = arg;
+    uint64_t total_bytes = 0;
+    for (uint32_t i = w->seg_start; i < w->seg_end; i++) {
+        const Segment *s = &w->segs[i];
+        total_bytes += s->file_end - s->file_start;
+    }
+    size_t est = (size_t)(total_bytes / QN_CHUNK_AVG + 64);
+    idx_init_cap(&w->idx, est * IDX_LOAD_DEN / IDX_LOAD_NUM + 1);
+
+    for (uint32_t i = w->seg_start; i < w->seg_end; i++) {
+        const Segment *s = &w->segs[i];
+        const uint8_t *data = w->maps[s->file_idx].data;
+        if (!data) continue;
+
+        PreChunkList *pcl = &w->seg_chunks[i];
+        chunk_range(data + s->file_start,
+                    s->file_end - s->file_start,
+                    s->file_start,    /* base_offset within file */
+                    pcl);
+
+        uint64_t gbase = w->offsets[s->file_idx];
+        for (uint32_t c = 0; c < pcl->count; c++)
+            idx_insert(&w->idx, pcl->c[c].sha,
+                        gbase + pcl->c[c].file_offset, pcl->c[c].len);
+    }
+    return NULL;
+}
+
+static int nproc(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int)n : 1;
+}
+
+/*
+ * Reassemble per-file PreChunkLists from per-segment lists.
+ * Segments within a file are ordered by seg_idx, so we just concatenate.
+ */
+static PreChunkList *reassemble_file_chunks(
+        const SegList *sl, const PreChunkList *seg_chunks, uint32_t file_count) {
+    PreChunkList *out = calloc(file_count, sizeof(PreChunkList));
+    if (!out) return NULL;
+    for (uint32_t i = 0; i < sl->count; i++) {
+        uint32_t fi = sl->s[i].file_idx;
+        const PreChunkList *src = &seg_chunks[i];
+        for (uint32_t c = 0; c < src->count; c++)
+            pcl_add(&out[fi], src->c[c].file_offset, src->c[c].len, src->c[c].sha);
+    }
+    return out;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §6  Encode one B file
+ * §6  Zero-copy literal tracker + encode helpers
  *
- * mmap the file, CDC-chunk, lookup each chunk in the index.
- *   HIT  → flush pending literals, emit REF(global_offset, len)
- *   MISS → accumulate into lit buffer
- * After processing, index this file's chunks at their global offsets so
- * later B files can reference them.
+ * Instead of copying LIT data into a heap buffer, we track the start
+ * pointer and length of a contiguous literal run in the mmap'd file.
+ * When flushed (at the next REF or end-of-file), the LIT opcode header
+ * is written, then the data goes directly from the mmap to the patch
+ * writer — one memcpy instead of three.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Growing literal accumulation buffer */
-typedef struct { uint8_t *buf; size_t len, cap; } LitBuf;
+typedef struct {
+    const uint8_t *start;   /* points into mmap'd file data (not owned) */
+    size_t         len;
+} LitRun;
 
-static int lb_append(LitBuf *lb, const uint8_t *data, size_t n) {
-    if (lb->len + n > lb->cap) {
-        size_t nc = (lb->len + n) * 2 + QN_CHUNK_MAX;
-        uint8_t *nb = realloc(lb->buf, nc);
-        if (!nb) return -1;
-        lb->buf = nb; lb->cap = nc;
-    }
-    memcpy(lb->buf + lb->len, data, n);
-    lb->len += n;
-    return 0;
-}
-
-static int lb_flush(LitBuf *lb, PW *pw) {
-    if (!lb->len) return 0;
-    /* split at 32 MB so u32 len field is never a problem */
-    size_t off = 0;
-    while (off < lb->len) {
-        uint32_t take = (uint32_t)(lb->len - off);
-        if (take > 32u*1024*1024) take = 32u*1024*1024;
+static void lit_flush(LitRun *lr, PW *pw) {
+    if (!lr->len) return;
+    const uint8_t *p = lr->start;
+    size_t rem = lr->len;
+    while (rem) {
+        uint32_t take = (uint32_t)(rem > 32u*1024*1024 ? 32u*1024*1024 : rem);
         pw_u8(pw, QN_OP_LIT);
         pw_u32(pw, take);
-        pw_write(pw, lb->buf + off, take);
-        off += take;
+        pw_write(pw, p, take);
+        p   += take;
+        rem -= take;
     }
-    lb->len = 0;
-    return 0;
+    lr->start = NULL;
+    lr->len   = 0;
 }
 
-static int encode_file(ChunkIdx *idx, PW *pw, LitBuf *lb,
-                        const char *abs_path, uint64_t global_base) {
-    int fd = open(abs_path, O_RDONLY);
-    if (fd < 0) return 0;
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { close(fd); return 0; }
-
-    const uint8_t *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (data == MAP_FAILED) return 0;
-    madvise((void*)data, st.st_size, MADV_SEQUENTIAL);
-
-    Rabin r; rabin_reset(&r);
-    size_t chunk_start = 0;
-
-    for (size_t i = 0; i < (size_t)st.st_size; i++) {
-        if (rabin_roll(&r, data[i]) || i == (size_t)st.st_size - 1) {
-            uint32_t       clen = (uint32_t)(i - chunk_start + 1);
-            uint8_t        sha[32];
-            SHA256(data + chunk_start, clen, sha);
-
-            const IdxEntry *e = idx_lookup(idx, sha);
-            if (e) {
-                lb_flush(lb, pw);
-                pw_u8 (pw, QN_OP_REF);
-                pw_u64(pw, e->global_offset);
-                pw_u32(pw, e->len);
-            } else {
-                lb_append(lb, data + chunk_start, clen);
-            }
-
-            /*
-             * Index this chunk immediately after encoding it.
-             * global_base + chunk_start is strictly less than the global
-             * offset of any subsequent chunk, so the strictly-before
-             * invariant holds for both later chunks in this same file
-             * and for all subsequent B files.
-             * idx_insert is a no-op if the sha is already present (dedup).
-             */
-            idx_insert(idx, sha, global_base + chunk_start, clen);
-
-            chunk_start = i + 1;
-            rabin_reset(&r);
-        }
+/* Extend the current literal run.  If the new chunk is not contiguous
+ * with the existing run (shouldn't happen within a file), flush first. */
+static void lit_extend(LitRun *lr, PW *pw,
+                        const uint8_t *data, uint32_t len) {
+    if (lr->len && lr->start + lr->len != data) {
+        /* non-contiguous — flush the old run first */
+        lit_flush(lr, pw);
     }
-    lb_flush(lb, pw);
-
-    munmap((void*)data, st.st_size);
-    return 0;
+    if (!lr->len) lr->start = data;
+    lr->len += len;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * §7  quine_compress
+ *
+ * Phase 1: mmap all files, prefetch
+ * Phase 2: build segments, parallel CDC + SHA-256 + index (A and B)
+ * Phase 3: merge indexes (A first, then B in thread order)
+ * Phase 4: sequential encode using pre-computed chunks + filtered lookup
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int quine_compress(const char *dir_a, const char *dir_b,
                       const char *patch_path) {
     int ret = -1;
+    int nth = nproc();
 
     /* ── 1. Collect file lists ── */
     FileList fla = {0}, flb = {0};
@@ -443,24 +591,144 @@ int quine_compress(const char *dir_a, const char *dir_b,
     progress("scan_b", NULL, 0, 0);
     if (collect_files(dir_b, &flb)) { SET_ERR("walk B failed"); goto done; }
 
-    /* ── 2. Build flat-A offset table and index all A chunks ── */
-    ChunkIdx idx; idx_init(&idx);
+    /* ── 2. Mmap all files with prefetch ── */
+    progress("mmap_a", NULL, 0, 0);
+    MmapFile *maps_a = mmap_all(dir_a, &fla, 1);
+    if (!maps_a) { SET_ERR("mmap A files"); goto done; }
 
+    progress("mmap_b", NULL, 0, 0);
+    MmapFile *maps_b = mmap_all(dir_b, &flb, 1);
+    if (!maps_b) { SET_ERR("mmap B files"); munmap_all(maps_a, fla.count); goto done; }
+
+    /* ── 3. Build global offset tables ── */
+    uint64_t *off_a = malloc(fla.count * sizeof(uint64_t));
+    uint64_t *off_b = malloc(flb.count * sizeof(uint64_t));
+    if ((!off_a && fla.count) || (!off_b && flb.count)) {
+        SET_ERR("OOM offsets"); free(off_a); free(off_b);
+        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+    }
     uint64_t flat_pos = 0;
     for (uint32_t i = 0; i < fla.count; i++) {
-        char abs[4096];
-        snprintf(abs, sizeof(abs), "%s/%s", dir_a, fla.e[i].rel);
-        progress("index_a", fla.e[i].rel, i + 1, fla.count);
-        index_file(&idx, abs, flat_pos);
-        flat_pos += fla.e[i].size;
+        off_a[i] = flat_pos; flat_pos += fla.e[i].size;
     }
-    uint64_t a_total = flat_pos;   /* B offsets start here */
+    for (uint32_t i = 0; i < flb.count; i++) {
+        off_b[i] = flat_pos; flat_pos += flb.e[i].size;
+    }
 
-    /* ── 3. Open patch file and write header ── */
+    /* ── 4. Build segments and launch parallel workers ── */
+    SegList segs_a = build_segments(maps_a, fla.count, nth);
+    SegList segs_b = build_segments(maps_b, flb.count, nth);
+
+    int nth_a = nth;
+    if (nth_a > (int)segs_a.count) nth_a = (int)segs_a.count;
+    if (nth_a < 1) nth_a = 1;
+
+    int nth_b = nth;
+    if (nth_b > (int)segs_b.count) nth_b = (int)segs_b.count;
+    if (nth_b < 1) nth_b = 1;
+
+    int total_threads = nth_a + nth_b;
+
+    PreChunkList *seg_chunks_a = calloc(segs_a.count, sizeof(PreChunkList));
+    PreChunkList *seg_chunks_b = calloc(segs_b.count, sizeof(PreChunkList));
+    SegWork      *a_works      = calloc(nth_a, sizeof(SegWork));
+    SegWork      *b_works      = calloc(nth_b, sizeof(SegWork));
+    pthread_t    *tids         = calloc(total_threads, sizeof(pthread_t));
+
+    if (!seg_chunks_a || !seg_chunks_b || !a_works || !b_works || !tids) {
+        SET_ERR("OOM threads");
+        free(seg_chunks_a); free(seg_chunks_b);
+        free(a_works); free(b_works); free(tids);
+        free(segs_a.s); free(segs_b.s);
+        free(off_a); free(off_b);
+        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+    }
+
+    /* Distribute segments across threads (round-robin by byte budget) */
+    {
+        /* A threads */
+        uint32_t per = segs_a.count / (uint32_t)nth_a;
+        uint32_t rem = segs_a.count % (uint32_t)nth_a;
+        uint32_t pos = 0;
+        for (int t = 0; t < nth_a; t++) {
+            a_works[t].maps       = maps_a;
+            a_works[t].offsets    = off_a;
+            a_works[t].segs       = segs_a.s;
+            a_works[t].seg_chunks = seg_chunks_a;
+            a_works[t].seg_start  = pos;
+            uint32_t n = per + (t < (int)rem ? 1 : 0);
+            a_works[t].seg_end    = pos + n;
+            pos += n;
+        }
+        /* B threads */
+        per = segs_b.count / (uint32_t)nth_b;
+        rem = segs_b.count % (uint32_t)nth_b;
+        pos = 0;
+        for (int t = 0; t < nth_b; t++) {
+            b_works[t].maps       = maps_b;
+            b_works[t].offsets    = off_b;
+            b_works[t].segs       = segs_b.s;
+            b_works[t].seg_chunks = seg_chunks_b;
+            b_works[t].seg_start  = pos;
+            uint32_t n = per + (t < (int)rem ? 1 : 0);
+            b_works[t].seg_end    = pos + n;
+            pos += n;
+        }
+    }
+
+    progress("index", NULL, 0, 0);
+
+    int ti = 0;
+    for (int t = 0; t < nth_a; t++)
+        pthread_create(&tids[ti++], NULL, seg_worker, &a_works[t]);
+    for (int t = 0; t < nth_b; t++)
+        pthread_create(&tids[ti++], NULL, seg_worker, &b_works[t]);
+    for (int t = 0; t < total_threads; t++)
+        pthread_join(tids[t], NULL);
+    free(tids);
+
+    /* ── 5. Merge indexes: A first (smallest offsets), then B in order ── */
+    progress("merge_index", NULL, 0, 0);
+    size_t total_chunks = 0;
+    for (int t = 0; t < nth_a; t++) total_chunks += a_works[t].idx.count;
+    for (int t = 0; t < nth_b; t++) total_chunks += b_works[t].idx.count;
+
+    ChunkIdx idx;
+    idx_init_cap(&idx, total_chunks * IDX_LOAD_DEN / IDX_LOAD_NUM + 1);
+
+    for (int t = 0; t < nth_a; t++) {
+        idx_merge(&idx, &a_works[t].idx);
+        idx_free(&a_works[t].idx);
+    }
+    free(a_works);
+
+    for (int t = 0; t < nth_b; t++) {
+        idx_merge(&idx, &b_works[t].idx);
+        idx_free(&b_works[t].idx);
+    }
+    free(b_works);
+    free(off_a);
+
+    /* Reassemble per-file chunk lists from per-segment lists */
+    PreChunkList *b_chunks = reassemble_file_chunks(&segs_b, seg_chunks_b, flb.count);
+
+    /* Free segment data */
+    for (uint32_t i = 0; i < segs_a.count; i++) pcl_free(&seg_chunks_a[i]);
+    free(seg_chunks_a); free(segs_a.s);
+    for (uint32_t i = 0; i < segs_b.count; i++) pcl_free(&seg_chunks_b[i]);
+    free(seg_chunks_b); free(segs_b.s);
+
+    if (!b_chunks && flb.count) {
+        SET_ERR("OOM reassemble"); idx_free(&idx); free(off_b);
+        munmap_all(maps_a, fla.count); munmap_all(maps_b, flb.count); goto done;
+    }
+
+    /* ── 6. Open patch file and write header ── */
     progress("write_header", NULL, 0, 0);
     PW pw;
     if (pw_open(&pw, patch_path)) {
-        SET_ERR("open patch: %s", strerror(errno)); goto done;
+        SET_ERR("open patch: %s", strerror(errno));
+        goto cleanup_all;
     }
 
     pw_write(&pw, QN_MAGIC, 4);
@@ -469,8 +737,7 @@ int quine_compress(const char *dir_a, const char *dir_b,
     pw_u32(&pw, QN_CHUNK_AVG);
     pw_u32(&pw, QN_CHUNK_MAX);
 
-    /* A manifest */
-    if (fla.count > 0xFFFF) { SET_ERR("too many A files"); goto done; }
+    if (fla.count > 0xFFFF) { SET_ERR("too many A files"); pw_close(&pw); goto cleanup_all; }
     pw_u16(&pw, (uint16_t)fla.count);
     for (uint32_t i = 0; i < fla.count; i++) {
         size_t plen = strlen(fla.e[i].rel); if (plen > 0xFFFF) plen = 0xFFFF;
@@ -479,8 +746,7 @@ int quine_compress(const char *dir_a, const char *dir_b,
         pw_u64(&pw, fla.e[i].size);
     }
 
-    /* B manifest — original file sizes, known from stat() */
-    if (flb.count > 0xFFFF) { SET_ERR("too many B files"); goto done; }
+    if (flb.count > 0xFFFF) { SET_ERR("too many B files"); pw_close(&pw); goto cleanup_all; }
     pw_u16(&pw, (uint16_t)flb.count);
     for (uint32_t i = 0; i < flb.count; i++) {
         size_t plen = strlen(flb.e[i].rel); if (plen > 0xFFFF) plen = 0xFFFF;
@@ -489,29 +755,54 @@ int quine_compress(const char *dir_a, const char *dir_b,
         pw_u64(&pw, flb.e[i].size);
     }
 
-    /* ── 4. Encode each B file; index it afterward ── */
-    LitBuf lb = {0};
-    flat_pos = a_total;
+    /* ── 7. Sequential encode using pre-computed chunks + filtered lookup ──
+     *
+     * LIT runs are tracked as zero-copy pointers into the mmap'd B file.
+     * Consecutive unmatched chunks accumulate into a single LitRun;
+     * when a REF is found (or end-of-file), the LIT opcode + data are
+     * written directly from the mmap — no intermediate heap copy. */
+    {
+        LitRun lr = {0};
+        for (uint32_t fi = 0; fi < flb.count; fi++) {
+            size_t plen = strlen(flb.e[fi].rel); if (plen > 0xFFFF) plen = 0xFFFF;
+            pw_u8(&pw, QN_OP_NEWFILE);
+            pw_u16(&pw, (uint16_t)plen);
+            pw_write(&pw, flb.e[fi].rel, plen);
 
-    for (uint32_t i = 0; i < flb.count; i++) {
-        char abs[4096];
-        snprintf(abs, sizeof(abs), "%s/%s", dir_b, flb.e[i].rel);
+            progress("encode_b", flb.e[fi].rel, fi + 1, flb.count);
 
-        size_t plen = strlen(flb.e[i].rel); if (plen > 0xFFFF) plen = 0xFFFF;
-        pw_u8(&pw, QN_OP_NEWFILE);
-        pw_u16(&pw, (uint16_t)plen);
-        pw_write(&pw, flb.e[i].rel, plen);
+            const PreChunkList *pcl = &b_chunks[fi];
+            const uint8_t *fdata = maps_b[fi].data;
 
-        progress("encode_b", flb.e[i].rel, i + 1, flb.count);
-        encode_file(&idx, &pw, &lb, abs, flat_pos);
-        flat_pos += flb.e[i].size;
+            for (uint32_t ci = 0; ci < pcl->count; ci++) {
+                const PreChunk *pc = &pcl->c[ci];
+                uint64_t chunk_global = off_b[fi] + pc->file_offset;
+
+                const IdxEntry *e = idx_lookup_before(&idx, pc->sha, chunk_global);
+                if (e) {
+                    lit_flush(&lr, &pw);
+                    pw_u8(&pw, QN_OP_REF);
+                    pw_u64(&pw, e->global_offset);
+                    pw_u32(&pw, e->len);
+                } else {
+                    lit_extend(&lr, &pw, fdata + pc->file_offset, pc->len);
+                }
+            }
+            lit_flush(&lr, &pw);
+        }
     }
-    free(lb.buf);
 
     pw_u8(&pw, QN_OP_END);
     pw_close(&pw);
-    idx_free(&idx);
     ret = 0;
+
+cleanup_all:
+    idx_free(&idx);
+    free(off_b);
+    for (uint32_t i = 0; i < flb.count; i++) pcl_free(&b_chunks[i]);
+    free(b_chunks);
+    munmap_all(maps_a, fla.count);
+    munmap_all(maps_b, flb.count);
 
 done:
     fl_free(&fla);
@@ -520,17 +811,13 @@ done:
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * §8  Slot table — maps global_offset → (fd, local_offset)
- *
- * Used by the decompressor to resolve a REF without knowing which file
- * it falls in.  Built from the A+B manifests in the patch header.
- * Slots are sorted by global_start; binary search resolves any offset.
+ * §8  Slot table
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    uint64_t global_start;  /* first byte of this file in the flat space */
+    uint64_t global_start;
     uint64_t size;
-    int      fd;            /* -1 = not yet available (future B file)     */
+    int      fd;
 } Slot;
 
 typedef struct {
@@ -550,13 +837,8 @@ static int st_add(SlotTable *t, uint64_t start, uint64_t size, int fd) {
     return 0;
 }
 
-/*
- * Resolve global_offset to (fd, local_offset).
- * Returns -1 if the slot is not yet available or out of range.
- */
 static int st_resolve(const SlotTable *t, uint64_t off,
                        int *fd_out, uint64_t *local_out) {
-    /* binary search — slots are added in order so always sorted */
     int lo = 0, hi = (int)t->count - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
@@ -564,7 +846,7 @@ static int st_resolve(const SlotTable *t, uint64_t off,
         else if (off >= t->s[mid].global_start + t->s[mid].size)
                                                    lo = mid + 1;
         else {
-            if (t->s[mid].fd < 0) return -1;       /* not yet written */
+            if (t->s[mid].fd < 0) return -1;
             *fd_out    = t->s[mid].fd;
             *local_out = off - t->s[mid].global_start;
             return 0;
@@ -574,7 +856,6 @@ static int st_resolve(const SlotTable *t, uint64_t off,
 }
 
 static void st_free(SlotTable *t) {
-    /* close all fds we own */
     for (uint32_t i = 0; i < t->count; i++)
         if (t->s[i].fd >= 0) close(t->s[i].fd);
     free(t->s); t->s = NULL; t->count = t->cap = 0;
@@ -630,7 +911,6 @@ int quine_decompress(const char *dir_a,
                         const char *out_dir) {
     int ret = -1;
 
-    /* ── mmap patch ── */
     int pfd = open(patch_path, O_RDONLY);
     if (pfd < 0) { SET_ERR("open patch: %s", strerror(errno)); return -1; }
     struct stat pst; fstat(pfd, &pst);
@@ -642,7 +922,6 @@ int quine_decompress(const char *dir_a,
 
     PR r = { pmem, (size_t)pst.st_size, 0 };
 
-    /* ── verify header ── */
     progress("read_header", NULL, 0, 0);
     {
         uint8_t magic[4]; pr_read(&r, magic, 4);
@@ -658,7 +937,6 @@ int quine_decompress(const char *dir_a,
     uint32_t cmin, cavg, cmax;
     pr_u32(&r,&cmin); pr_u32(&r,&cavg); pr_u32(&r,&cmax);
 
-    /* ── build slot table from A manifest ── */
     SlotTable st = {0};
     uint64_t flat_pos = 0;
 
@@ -675,21 +953,13 @@ int quine_decompress(const char *dir_a,
         abs[n + plen] = '\0';
         r.pos += plen;
         uint64_t sz = 0; pr_u64(&r, &sz);
-
         int fd = open(abs, O_RDONLY);
-        /* fd == -1 is stored; st_resolve will return -1 if referenced */
         st_add(&st, flat_pos, sz, fd);
         flat_pos += sz;
     }
     uint64_t a_total = flat_pos;
 
-    /* ── read B manifest to pre-populate slot table with fd=-1 ── */
     uint16_t b_count = 0; pr_u16(&r, &b_count);
-
-    /*
-     * We need B file info (path, size) during the opcode loop.
-     * Store them in a small parallel array — just path strings and sizes.
-     */
     char    **b_paths = calloc(b_count, sizeof(char*));
     uint64_t *b_sizes = calloc(b_count, sizeof(uint64_t));
     if (!b_paths || !b_sizes) { SET_ERR("OOM"); goto out_slots; }
@@ -703,107 +973,67 @@ int quine_decompress(const char *dir_a,
         memcpy(rel, r.base + r.pos, plen); rel[plen] = '\0';
         r.pos += plen;
         uint64_t sz = 0; pr_u64(&r, &sz);
-
-        /* absolute output path */
         char abs[4096];
         snprintf(abs, sizeof(abs), "%s/%s", out_dir, rel);
         free(rel);
         b_paths[i] = strdup(abs);
         b_sizes[i] = sz;
-
-        /* register slot with fd=-1; fd filled in as each file completes */
         st_add(&st, flat_pos, sz, -1);
         flat_pos += sz;
     }
 
-    /* ── ensure output root exists ── */
     { char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",out_dir); mkdirp(tmp); }
 
-    /* ── ONE copy buffer for all REF operations ── */
     uint8_t *copybuf = malloc(cmax);
     if (!copybuf) { SET_ERR("OOM copybuf"); goto out_binfo; }
 
-    /* ── opcode loop ── */
-    int     out_fd    = -1;    /* current output file write-fd  */
-    int     out_rd    = -1;    /* current output file read-fd   */
-    uint16_t b_idx    = 0;     /* which B file we are writing   */
-    int      slot_idx = (int)a_count;   /* index into st for current B file */
-
-    /*
-     * Index into st.s for the B file currently being written.
-     * We open a read-fd on NEWFILE so self-referential REFs work immediately.
-     */
+    int      out_fd   = -1;
+    int      out_rd   = -1;
+    uint16_t b_idx    = 0;
+    int      slot_idx = (int)a_count;
 
     while (1) {
         uint8_t op;
         if (pr_u8(&r, &op)) goto out_copy;
         if (op == QN_OP_END) break;
 
-        /* ── NEWFILE ── */
         if (op == QN_OP_NEWFILE) {
-            /* Seal the previous B file: close write-fd, install read-fd in
-             * slot table so subsequent files can reference it. */
-            if (out_fd >= 0) {
-                close(out_fd); out_fd = -1;
-                /* out_rd already registered in slot; leave it open */
-                out_rd = -1;
-            }
-
+            if (out_fd >= 0) { close(out_fd); out_fd = -1; out_rd = -1; }
             uint16_t plen = 0; pr_u16(&r, &plen);
             if (pr_need(&r, plen)) goto out_copy;
-            /* path is already stored in b_paths[b_idx]; just advance pos */
             r.pos += plen;
-
             const char *outpath = b_paths[b_idx];
-
-            /* create parent directories */
             char tmp[4096]; snprintf(tmp,sizeof(tmp),"%s",outpath);
             char *sl = strrchr(tmp,'/');
             if (sl && sl != tmp) { *sl='\0'; mkdirp(tmp); }
-
-            /* open for writing */
             out_fd = open(outpath, O_CREAT|O_WRONLY|O_TRUNC, 0644);
             if (out_fd < 0) {
                 SET_ERR("open output %s: %s", outpath, strerror(errno));
                 goto out_copy;
             }
-
-            /*
-             * Open a separate read-fd on the same file immediately.
-             * This allows self-referential REFs (later chunks referencing
-             * earlier chunks of the same file) to work via pread() without
-             * touching the write position.
-             */
             out_rd = open(outpath, O_RDONLY);
             if (out_rd < 0) {
                 SET_ERR("open read-fd %s: %s", outpath, strerror(errno));
                 goto out_copy;
             }
-
-            /* Register read-fd in the slot table for this B file */
             slot_idx = (int)a_count + (int)b_idx;
             st.s[slot_idx].fd = out_rd;
-
             b_idx++;
             progress("restore", b_paths[b_idx - 1], b_idx, b_count);
             continue;
         }
 
-        /* ── REF ── */
         if (op == QN_OP_REF) {
             uint64_t off; uint32_t len;
             if (pr_u64(&r,&off) || pr_u32(&r,&len)) goto out_copy;
             if (out_fd < 0) { SET_ERR("REF before NEWFILE"); goto out_copy; }
             if (len > cmax)  { SET_ERR("REF len %u > chunk_max", len); goto out_copy; }
-
-            int      src_fd;
-            uint64_t local_off;
+            int src_fd; uint64_t local_off;
             if (st_resolve(&st, off, &src_fd, &local_off)) {
                 SET_ERR("REF offset %llu not in slot table",
                         (unsigned long long)off);
                 goto out_copy;
             }
-
             ssize_t got = pread(src_fd, copybuf, len, (off_t)local_off);
             if (got != (ssize_t)len) {
                 SET_ERR("pread at global %llu: got %zd expected %u",
@@ -816,7 +1046,6 @@ int quine_decompress(const char *dir_a,
             continue;
         }
 
-        /* ── LIT ── */
         if (op == QN_OP_LIT) {
             uint32_t len; pr_u32(&r,&len);
             if (pr_need(&r,len)) goto out_copy;
@@ -831,12 +1060,11 @@ int quine_decompress(const char *dir_a,
         SET_ERR("unknown opcode 0x%02x at %zu", op, r.pos-1);
         goto out_copy;
     }
-    ret = 0;   /* success */
+    ret = 0;
 
 out_copy:
     free(copybuf);
     if (out_fd >= 0) close(out_fd);
-    /* out_rd is registered in st and will be closed by st_free */
 out_binfo:
     for (uint16_t i = 0; i < b_count; i++) free(b_paths[i]);
     free(b_paths); free(b_sizes);

@@ -715,6 +715,234 @@ static void t_idempotent(void) {
     PASS();
 }
 
+/* ── T17: query-time offset filter — no forward references ──────────────── */
+/*
+ * B has two files: first.bin and second.bin (lex order).  second.bin is all
+ * new content.  first.bin's content is identical to second.bin.
+ * A is empty.
+ *
+ * In the flat space, first.bin comes before second.bin.  When encoding
+ * first.bin, its chunks must NOT match second.bin (which is later in the
+ * stream).  The offset filter in idx_lookup_before must reject these.
+ * second.bin's chunks SHOULD match first.bin (earlier in the stream).
+ *
+ * Round-trip must succeed, and the patch should be smaller than 2× the
+ * data (second.bin is deduplicated against first.bin).
+ */
+static void t_offset_filter_no_fwd_ref(void) {
+    char a[1024], b[1024], p[1024], o[1024];
+    mkdirs(P(a,sizeof(a),"t17/a"));
+    mkdirs(P(b,sizeof(b),"t17/b"));
+
+    uint8_t blob[128*1024];
+    prng_fill(blob, sizeof(blob), 0xF117);
+
+    char f1[1024], f2[512];
+    /* lex order: "aaa_first" < "zzz_second" */
+    snprintf(f1,sizeof(f1),"%s/aaa_first.bin",b);
+    snprintf(f2,sizeof(f2),"%s/zzz_second.bin",b);
+    write_file(f1, blob, sizeof(blob));
+    write_file(f2, blob, sizeof(blob));
+
+    P(p,sizeof(p),"t17/out.patch");
+    P(o,sizeof(o),"t17/out");
+
+    int r = roundtrip(a, b, p, o);
+    if (r == -1) FAIL("compress: %s", quine_errmsg());
+    if (r == -2) FAIL("decompress: %s", quine_errmsg());
+    if (r == -3) FAIL("output mismatch");
+
+    /* aaa_first is LIT, zzz_second should be REF → patch ~ 1× blob, not 2× */
+    int64_t psz = file_size(p);
+    if (psz > (int64_t)sizeof(blob) * 3 / 2)
+        FAIL("patch (%lld B) too large — zzz_second not deduplicated against "
+             "aaa_first (%lld B each)", (long long)psz, (long long)sizeof(blob));
+    PASS();
+}
+
+/* ── T18: uneven file sizes — parallel work balance ─────────────────────── */
+/*
+ * A has one very large file and many tiny files.  B is identical.
+ * This stresses byte-balanced thread distribution: if threads are assigned
+ * by file count, one thread gets the big file alone while others share
+ * tiny files and finish instantly.  The round-trip must still produce
+ * correct output.
+ */
+static void t_uneven_file_sizes(void) {
+    char a[1024], b[1024], p[1024], o[1024];
+    mkdirs(P(a,sizeof(a),"t18/a"));
+    mkdirs(P(b,sizeof(b),"t18/b"));
+
+    /* One 512 KB file */
+    uint8_t *big = malloc(512*1024);
+    prng_fill(big, 512*1024, 0x1800);
+    char pa[1024], pb[512];
+    snprintf(pa,sizeof(pa),"%s/big.bin",a);
+    snprintf(pb,sizeof(pb),"%s/big.bin",b);
+    write_file(pa, big, 512*1024);
+    write_file(pb, big, 512*1024);
+    free(big);
+
+    /* 20 tiny files (1 KB each) */
+    for (int i = 0; i < 20; i++) {
+        uint8_t tiny[1024];
+        prng_fill(tiny, sizeof(tiny), (uint64_t)(0x1810 + i));
+        snprintf(pa,sizeof(pa),"%s/tiny_%02d.bin",a,i);
+        snprintf(pb,sizeof(pb),"%s/tiny_%02d.bin",b,i);
+        write_file(pa, tiny, sizeof(tiny));
+        write_file(pb, tiny, sizeof(tiny));
+    }
+
+    P(p,sizeof(p),"t18/out.patch");
+    P(o,sizeof(o),"t18/out");
+
+    int r = roundtrip(a, b, p, o);
+    if (r == -1) FAIL("compress: %s", quine_errmsg());
+    if (r == -2) FAIL("decompress: %s", quine_errmsg());
+    if (r == -3) FAIL("output mismatch");
+
+    /* All files identical → patch should be very small (all REFs) */
+    int64_t psz = file_size(p);
+    if (psz > 4096)
+        FAIL("patch (%lld B) too large for identical dirs", (long long)psz);
+    PASS();
+}
+
+/* ── T19: B-to-earlier-B dedup across three files ───────────────────────── */
+/*
+ * No A files.  B has three files in lex order:
+ *   aaa.bin — unique content X
+ *   bbb.bin — unique content Y
+ *   ccc.bin — same content as aaa.bin (content X)
+ *
+ * ccc.bin must deduplicate against aaa.bin (earlier), not bbb.bin.
+ * The offset filter must allow the match (aaa < ccc in flat space).
+ */
+static void t_b_to_earlier_b_dedup(void) {
+    char a[1024], b[1024], p[1024], o[1024];
+    mkdirs(P(a,sizeof(a),"t19/a"));
+    mkdirs(P(b,sizeof(b),"t19/b"));
+
+    uint8_t blobx[96*1024], bloby[96*1024];
+    prng_fill(blobx, sizeof(blobx), 0x1901);
+    prng_fill(bloby, sizeof(bloby), 0x1902);
+
+    char path[1024];
+    snprintf(path,sizeof(path),"%s/aaa.bin",b); write_file(path,blobx,sizeof(blobx));
+    snprintf(path,sizeof(path),"%s/bbb.bin",b); write_file(path,bloby,sizeof(bloby));
+    snprintf(path,sizeof(path),"%s/ccc.bin",b); write_file(path,blobx,sizeof(blobx));
+
+    P(p,sizeof(p),"t19/out.patch");
+    P(o,sizeof(o),"t19/out");
+
+    int r = roundtrip(a, b, p, o);
+    if (r == -1) FAIL("compress: %s", quine_errmsg());
+    if (r == -2) FAIL("decompress: %s", quine_errmsg());
+    if (r == -3) FAIL("output mismatch");
+
+    /* Two unique blobs as LIT + one as REF → patch ~ 2× blob, not 3× */
+    int64_t psz = file_size(p);
+    int64_t two_blobs = (int64_t)(sizeof(blobx) + sizeof(bloby));
+    if (psz > two_blobs * 3 / 2)
+        FAIL("patch (%lld B) too large — ccc.bin not deduplicated against "
+             "aaa.bin (%lld B expected)", (long long)psz, (long long)two_blobs);
+    PASS();
+}
+
+/* ── T20: many small B files (stress parallel B chunking) ───────────────── */
+/*
+ * A has one shared blob.  B has 50 files, each containing the same blob
+ * plus a small unique suffix.  This stresses parallel B chunking with
+ * many files distributed across worker threads.
+ */
+static void t_many_small_b_files(void) {
+    char a[1024], b[1024], p[1024], o[1024];
+    mkdirs(P(a,sizeof(a),"t20/a"));
+    mkdirs(P(b,sizeof(b),"t20/b"));
+
+    uint8_t shared[32*1024];
+    prng_fill(shared, sizeof(shared), 0x2000);
+
+    char path[1024];
+    snprintf(path,sizeof(path),"%s/shared.bin",a);
+    write_file(path, shared, sizeof(shared));
+
+    for (int i = 0; i < 50; i++) {
+        uint8_t buf[33*1024];   /* shared + 1 KB unique suffix */
+        memcpy(buf, shared, sizeof(shared));
+        prng_fill(buf + sizeof(shared), 1024, (uint64_t)(0x2010 + i));
+        snprintf(path,sizeof(path),"%s/file_%03d.bin",b,i);
+        write_file(path, buf, sizeof(shared) + 1024);
+    }
+
+    P(p,sizeof(p),"t20/out.patch");
+    P(o,sizeof(o),"t20/out");
+
+    int r = roundtrip(a, b, p, o);
+    if (r == -1) FAIL("compress: %s", quine_errmsg());
+    if (r == -2) FAIL("decompress: %s", quine_errmsg());
+    if (r == -3) FAIL("output mismatch");
+
+    /* 50 files × 33 KB = 1.6 MB raw.  The shared 32 KB prefix should be
+     * mostly deduplicated across files, though CDC boundary shifts from the
+     * unique suffix reduce savings.  Patch should be well under raw size. */
+    int64_t psz = file_size(p);
+    int64_t raw = 50 * (int64_t)(sizeof(shared) + 1024);
+    if (psz > raw * 3 / 4)
+        FAIL("patch (%lld B) too large for %lld B raw — shared prefix not "
+             "deduplicated across B files", (long long)psz, (long long)raw);
+    PASS();
+}
+
+/* ── T21: reversed lex order dedup — offset filter direction ────────────── */
+/*
+ * B has two files: zzz.bin (written first in lex order? no — lex order
+ * puts aaa before zzz).  Actually: we want to test that a LATER file
+ * in lex order can reference an EARLIER file but not vice versa.
+ *
+ * B files:  aaa_src.bin = content X,  zzz_dup.bin = content X
+ * Both indexed in parallel.  When encoding aaa_src (first in lex order),
+ * the filter must NOT let it reference zzz_dup (later).  When encoding
+ * zzz_dup, the filter MUST let it reference aaa_src.
+ *
+ * Verify by checking patch size: should be ~1× blob (aaa as LIT, zzz as REF).
+ * If the filter were broken and aaa referenced zzz, decompression would fail
+ * (forward reference).
+ */
+static void t_lex_order_dedup_direction(void) {
+    char a[1024], b[1024], p[1024], o[1024];
+    mkdirs(P(a,sizeof(a),"t21/a"));
+    mkdirs(P(b,sizeof(b),"t21/b"));
+
+    /* Larger blob to ensure multiple chunks */
+    uint8_t *blob = malloc(256*1024);
+    prng_fill(blob, 256*1024, 0x2100);
+
+    char path[1024];
+    snprintf(path,sizeof(path),"%s/aaa_src.bin",b);
+    write_file(path, blob, 256*1024);
+    snprintf(path,sizeof(path),"%s/zzz_dup.bin",b);
+    write_file(path, blob, 256*1024);
+    free(blob);
+
+    P(p,sizeof(p),"t21/out.patch");
+    P(o,sizeof(o),"t21/out");
+
+    int r = roundtrip(a, b, p, o);
+    if (r == -1) FAIL("compress: %s", quine_errmsg());
+    if (r == -2) FAIL("decompress: %s", quine_errmsg());
+    if (r == -3) FAIL("output mismatch — possible forward reference in patch");
+
+    int64_t psz = file_size(p);
+    /* aaa_src is 256 KB LIT, zzz_dup is all REFs → patch ~ 256 KB + opcodes */
+    if (psz > 300*1024)
+        FAIL("patch (%lld B) too large — zzz_dup not deduplicated", (long long)psz);
+    if (psz < 200*1024)
+        FAIL("patch (%lld B) suspiciously small — aaa_src may have forward-referenced zzz_dup",
+             (long long)psz);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * §4  Test registry and runner
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -738,6 +966,11 @@ static const Test TESTS[] = {
     { "version_mismatch",        t_version_mismatch        },
     { "large_realistic",         t_large_realistic         },
     { "idempotent",              t_idempotent              },
+    { "offset_filter_no_fwd",   t_offset_filter_no_fwd_ref },
+    { "uneven_file_sizes",      t_uneven_file_sizes        },
+    { "b_to_earlier_b_dedup",   t_b_to_earlier_b_dedup     },
+    { "many_small_b_files",     t_many_small_b_files       },
+    { "lex_order_dedup_dir",    t_lex_order_dedup_direction},
 };
 static const int NTEST = (int)(sizeof(TESTS)/sizeof(TESTS[0]));
 

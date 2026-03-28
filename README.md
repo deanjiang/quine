@@ -161,6 +161,7 @@ src/quine.c             library implementation
 tests/test.c            test suite
 main.c                  CLI driver (convenience tool)
 Makefile
+build/                  all generated artifacts (gitignored)
 ```
 
 ## Build
@@ -168,17 +169,18 @@ Makefile
 ```bash
 git clone <repo>
 cd quine
-make            # builds libquine.a, quine CLI, and test_quine
+make            # builds everything into build/
 ```
 
-Individual targets:
+All artifacts are placed in `build/`:
 
 ```bash
-make libquine.a     # static library only
-make libquine.so    # shared library
-make quine          # CLI binary (links libquine.a)
-make test_quine     # test binary
-make test           # build and run tests
+make                          # build/libquine.a, build/quine, build/test_quine
+make build/libquine.a         # static library only
+make build/libquine.so        # shared library
+make build/quine              # CLI binary (links libquine.a)
+make build/test_quine         # test binary
+make test                     # build and run tests
 ```
 
 Debug build:
@@ -199,33 +201,50 @@ equivalent.
 ### Compress
 
 ```bash
-./quine compress <dir_a> <dir_b> <output.patch>
+build/quine compress <dir_a> <dir_b> <output.patch>
 ```
+
+The CLI shows per-file progress and automatically verifies the patch by
+decompressing to a temporary directory and comparing against dir B.
 
 Example output:
 
 ```
+compressing...
+  [scan_a]
+  [scan_b]
+  [index_a] (1/2) src/engine.bin
+  [index_a] (2/2) src/main.c
+  [write_header]
+  [encode_b] (1/3) assets/new.bin
+  [encode_b] (2/3) src/engine.bin
+  [encode_b] (3/3) src/main.c
+
 patch written: /tmp/B.patch
 
-  dir A size:          885.2 KB
-  dir B size:          1.18 MB
-  patch size:          246.1 KB
-  ratio:               4.90x  (80% savings)
+  dir A size:          264.0 KB
+  dir B size:          296.0 KB
+  patch size:          52.0 KB
+  ratio:               5.69x  (82% savings)
 
   operation:           compress
-  wall time:           0.027 s
-  cpu time:            0.020 s (user)  0.000 s (sys)
-  cores used:          0.75
-  peak RSS:            51112 KB
-```
+  wall time:           0.003 s
+  cpu time:            0.002 s (user)  0.001 s (sys)
+  cores used:          1.00
+  peak RSS:            55260 KB
 
-`cores used` is `(user_cpu + sys_cpu) / wall_time`.  A parallel encoder would
-show values above 1.0.
+verifying...
+  [read_header]
+  [restore] (1/3) /tmp/quine_verify_511953/assets/new.bin
+  [restore] (2/3) /tmp/quine_verify_511953/src/engine.bin
+  [restore] (3/3) /tmp/quine_verify_511953/src/main.c
+  OK: round-trip verified
+```
 
 ### Decompress
 
 ```bash
-./quine decompress <dir_a> <input.patch> <out_dir>
+build/quine decompress <dir_a> <input.patch> <out_dir>
 ```
 
 `out_dir` is created if it does not exist.
@@ -233,27 +252,30 @@ show values above 1.0.
 Example output:
 
 ```
-restored to: /tmp/B_restored
+decompressing...
+  [read_header]
+  [restore] (1/3) /tmp/restored/assets/new.bin
+  [restore] (2/3) /tmp/restored/src/engine.bin
+  [restore] (3/3) /tmp/restored/src/main.c
 
-  patch size:          246.1 KB
-  output size:         1.18 MB
+restored to: /tmp/restored
+
+  patch size:          52.0 KB
+  output size:         296.0 KB
 
   operation:           decompress
-  wall time:           0.004 s
-  cpu time:            0.000 s (user)  0.000 s (sys)
-  cores used:          0.00
-  peak RSS:            8740 KB
+  wall time:           0.003 s
+  cpu time:            0.000 s (user)  0.003 s (sys)
+  cores used:          1.00
+  peak RSS:            5648 KB
 ```
-
-Peak RSS for decompression is dominated by the `mmap` of the patch file itself.
-The algorithm contributes only one 64 KB copy buffer.
 
 ---
 
 ## Library API
 
-Add `-Ipath/to/quine/include` to your compiler flags and link against `libquine.a`
-(or `libquine.so`).
+Add `-Ipath/to/quine/include` to your compiler flags and link against
+`build/libquine.a` (or `build/libquine.so`).
 
 ```c
 #include "quine/quine.h"
@@ -329,15 +351,15 @@ int main(void) {
 Linking against the static library:
 
 ```bash
-gcc -O2 -D_GNU_SOURCE -Ipath/to/quine/include -o myapp myapp.c -Lpath/to/quine -lquine -lssl -lcrypto
+gcc -O2 -D_GNU_SOURCE -Ipath/to/quine/include -o myapp myapp.c -Lpath/to/quine/build -lquine -lssl -lcrypto
 ```
 
 Or against the shared library:
 
 ```bash
-make libquine.so
-gcc -O2 -D_GNU_SOURCE -Ipath/to/quine/include -o myapp myapp.c -Lpath/to/quine -lquine -lssl -lcrypto
-LD_LIBRARY_PATH=path/to/quine ./myapp
+make build/libquine.so
+gcc -O2 -D_GNU_SOURCE -Ipath/to/quine/include -o myapp myapp.c -Lpath/to/quine/build -lquine -lssl -lcrypto
+LD_LIBRARY_PATH=path/to/quine/build ./myapp
 ```
 
 ---

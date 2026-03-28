@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
-LDFLAGS = -lssl -lcrypto
+LDFLAGS = -lssl -lcrypto -lpthread
 
 INCDIR  = include
 SRCDIR  = src
@@ -22,10 +22,10 @@ LIB_OBJ = $(BUILDDIR)/quine.o
 $(BUILDDIR)/quine.o: $(LIB_SRC) $(INCDIR)/quine/quine.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-libquine.a: $(LIB_OBJ)
+$(BUILDDIR)/libquine.a: $(LIB_OBJ)
 	ar rcs $@ $^
 
-libquine.so: $(LIB_SRC) $(INCDIR)/quine/quine.h
+$(BUILDDIR)/libquine.so: $(LIB_SRC) $(INCDIR)/quine/quine.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $(LIB_SRC) $(LDFLAGS)
 
 # ── CLI (convenience) ─────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ libquine.so: $(LIB_SRC) $(INCDIR)/quine/quine.h
 $(BUILDDIR)/main.o: main.c $(INCDIR)/quine/quine.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-quine: $(BUILDDIR)/main.o libquine.a
+$(BUILDDIR)/quine: $(BUILDDIR)/main.o $(BUILDDIR)/libquine.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -41,20 +41,20 @@ quine: $(BUILDDIR)/main.o libquine.a
 $(BUILDDIR)/test.o: $(TESTDIR)/test.c $(INCDIR)/quine/quine.h | $(BUILDDIR)
 	$(CC) $(TEST_CFLAGS) -c -o $@ $<
 
-test_quine: $(BUILDDIR)/test.o libquine.a
+$(BUILDDIR)/test_quine: $(BUILDDIR)/test.o $(BUILDDIR)/libquine.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 
-all: libquine.a quine test_quine
+all: $(BUILDDIR)/libquine.a $(BUILDDIR)/quine $(BUILDDIR)/test_quine
 
-test: test_quine
-	./test_quine
+test: $(BUILDDIR)/test_quine
+	$(BUILDDIR)/test_quine
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 clean:
-	rm -rf $(BUILDDIR) quine test_quine libquine.a libquine.so
+	rm -rf $(BUILDDIR)
 
 .PHONY: all test clean
