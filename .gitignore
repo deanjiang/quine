@@ -4,7 +4,6 @@ build/
 # Runtime outputs
 output/
 *.patch
-patch-*
 
 # Editor and OS
 .DS_Store

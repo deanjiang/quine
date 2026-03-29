@@ -118,26 +118,9 @@ intermediate buffer.
 
 ### Wire format
 
-All integers are little-endian.
-
-```
-Header:
-  magic[4]         \xDDLT
-  version          u8       (3)
-  chunk_min        u32      default 4096
-  chunk_avg        u32      default 16384
-  chunk_max        u32      default 65536
-  a_count          u16
-  [ u16 path_len | path... | u64 file_size ] × a_count   (lex order)
-  b_count          u16
-  [ u16 path_len | path... | u64 file_size ] × b_count   (lex order)
-
-Opcode stream:
-  0x01  REF      u64:global_offset | u32:len
-  0x02  LIT      u32:len | <bytes>
-  0x03  NEWFILE  u16:path_len | <path>
-  0x04  END
-```
+See [patch-format-v3.md](patch-format-v3.md) for the full binary format
+specification.  The version number is stored in the patch header; any format
+change requires a version bump.
 
 ---
 
