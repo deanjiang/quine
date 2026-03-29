@@ -230,25 +230,38 @@ else
     fi
 fi
 
-# ── 5. zstd delta decompress (zstd + untar) ──
+# ── 5. zstd delta decompress (tar A + zstd + untar) ──
+#
+# In real deployment, the receiver must tar dir A before decompressing.
+# Re-create a.tar fresh to measure this fairly (don't reuse from step 4).
 
 echo ""
-echo "=== 5. zstd delta decompress (zstd + untar) ==="
+echo "=== 5. zstd delta decompress (tar A + zstd + untar) ==="
 if [ "$Z_COMP_OK" -eq 1 ]; then
+    # Receiver must tar dir A as prerequisite
+    TAR_A_DEC="$TMPDIR/a_dec.tar"
+    if run_cmd tar cf "$TAR_A_DEC" -C "$(dirname "$DIR_A")" "$(basename "$DIR_A")"; then
+        Z_DEC_TAR_A_WALL=$LAST_WALL
+        Z_DEC_TAR_A_RSS=$LAST_RSS_KB
+    else
+        echo "  FAILED: tar A (exit $LAST_RC)"
+    fi
+
     ZSTD_RESTORED_TAR="$TMPDIR/b_restored.tar"
-    if run_cmd zstd -d --long=31 --memory=2048MB --patch-from="$TAR_A" "$ZSTD_PATCH" -o "$ZSTD_RESTORED_TAR"; then
+    if run_cmd zstd -d --long=31 --memory=2048MB --patch-from="$TAR_A_DEC" "$ZSTD_PATCH" -o "$ZSTD_RESTORED_TAR"; then
         ZSTD_DEC_WALL=$LAST_WALL
         ZSTD_DEC_RSS=$LAST_RSS_KB
         ZSTD_RESTORED="$TMPDIR/zstd_restored"
         mkdir -p "$ZSTD_RESTORED"
-        # Time untar too
         if run_cmd tar xf "$ZSTD_RESTORED_TAR" -C "$ZSTD_RESTORED"; then
-            Z_DEC_WALL=$(awk "BEGIN{printf \"%.1f\", $ZSTD_DEC_WALL + $LAST_WALL}")
+            # Total decompress = tar A + zstd decompress + untar B
+            Z_DEC_WALL=$(awk "BEGIN{printf \"%.1f\", ${Z_DEC_TAR_A_WALL:-0} + $ZSTD_DEC_WALL + $LAST_WALL}")
             Z_DEC_RSS=$ZSTD_DEC_RSS
+            [ "${Z_DEC_TAR_A_RSS:-0}" -gt "$Z_DEC_RSS" ] && Z_DEC_RSS=${Z_DEC_TAR_A_RSS}
             [ "$LAST_RSS_KB" -gt "$Z_DEC_RSS" ] && Z_DEC_RSS=$LAST_RSS_KB
             Z_DEC_SZ=$(dir_size "$ZSTD_RESTORED")
             Z_DEC_OK=1
-            print_summary "zstd delta + untar" "$Z_DEC_WALL" "$Z_DEC_RSS" "$Z_DEC_SZ" ""
+            print_summary "tar A + zstd delta + untar" "$Z_DEC_WALL" "$Z_DEC_RSS" "$Z_DEC_SZ" ""
         else
             echo "  FAILED: untar (exit $LAST_RC)"
         fi
@@ -300,7 +313,7 @@ fi
 
 if [ "$Z_DEC_OK" -eq 1 ]; then
     printf "  %-30s %12s %12s %12s %10s\n" \
-        "zstd delta + untar" "$(fmt_wall "$Z_DEC_WALL")" "$(fmt_size $((Z_DEC_RSS * 1024)))" "$(fmt_size "$Z_DEC_SZ")" "-"
+        "tar A + zstd delta + untar" "$(fmt_wall "$Z_DEC_WALL")" "$(fmt_size $((Z_DEC_RSS * 1024)))" "$(fmt_size "$Z_DEC_SZ")" "-"
 else
-    printf "  %-30s %12s\n" "zstd delta + untar" "FAILED"
+    printf "  %-30s %12s\n" "tar A + zstd delta + untar" "FAILED"
 fi
