@@ -5,7 +5,7 @@
 # Usage:
 #   ./scripts/benchmark.sh <dir_a> <dir_b>
 #
-# Runs 6 tasks:
+# Runs 5 tasks:
 #   1. quine compress
 #   2. zip quine patch
 #   3. unzip + quine decompress
