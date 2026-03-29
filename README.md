@@ -11,6 +11,41 @@ Quine is available as a **C library** (`libquine`) and a **CLI tool**.
 
 ---
 
+## Performance
+
+Benchmarked on ~1 GB model weight directories (8 files, WSL2 on NVMe):
+
+| | quine + zip | zstd --patch-from |
+|---|---|---|
+| **Compress time** | 10.1s | 1.7s |
+| **Decompress time** | 6.5s | 1.1s |
+| **Output size** | 175 MB (5.40x) | 173 MB (5.47x) |
+| **Decompress memory** | **6.4 MB** | 1.52 GB |
+| **Max input size** | **unlimited** | 2 GB |
+
+**Comparable compression.** Combined with zip, quine achieves compression
+ratios within 1% of zstd's byte-level delta mode (5.40x vs 5.47x).  Quine
+handles the structural dedup via CDC; zip compresses the remaining literal
+bytes.
+
+**Minimal decompression memory.** The decompressor uses a fixed ~6.5 MB
+regardless of input size — a 4 MB read buffer, a 64 KB copy buffer, and a
+small slot table.  No data proportional to A, B, or the patch is ever
+allocated.  This is **238x less memory** than zstd's delta decompressor on the
+same workload.
+
+**No size limits.** zstd's `--patch-from` loads the entire reference into
+memory, limiting it to ~2 GB.  Quine has no such constraint — it streams A
+files via `pread()` and reads the patch through a buffered reader.  Tested on
+directories up to 5 GB with 6.5 MB decompression RSS.
+
+**Parallel compression.** Both A and B files are indexed in parallel across all
+CPU cores using segment-based work distribution (large files are split across
+threads).  On a 16-core machine, compression achieves 1.8x core utilization
+on I/O-bound workloads.
+
+---
+
 ## Algorithm
 
 Quine uses content-defined chunking (CDC) with a Rabin rolling hash to split
