@@ -192,49 +192,68 @@ else
     echo "  SKIPPED (zip failed)"
 fi
 
-# ── 4. zstd delta compress ──
+# ── 4. zstd delta compress (tar + zstd) ──
 
 echo ""
-echo "=== 4. zstd delta compress ==="
+echo "=== 4. zstd delta compress (tar + zstd) ==="
 TAR_A="$TMPDIR/a.tar"
 TAR_B="$TMPDIR/b.tar"
-echo "  \$ tar cf $TAR_A ..."
-tar cf "$TAR_A" -C "$(dirname "$DIR_A")" "$(basename "$DIR_A")"
-echo "  \$ tar cf $TAR_B ..."
-tar cf "$TAR_B" -C "$(dirname "$DIR_B")" "$(basename "$DIR_B")"
-TAR_A_SZ=$(stat -c%s "$TAR_A")
+# Time tar as part of zstd's pipeline — it's a required prerequisite
+if run_cmd tar cf "$TAR_A" -C "$(dirname "$DIR_A")" "$(basename "$DIR_A")"; then
+    TAR_A_WALL=$LAST_WALL
+    TAR_A_RSS=$LAST_RSS_KB
+else
+    echo "  FAILED: tar A (exit $LAST_RC)"
+fi
+if run_cmd tar cf "$TAR_B" -C "$(dirname "$DIR_B")" "$(basename "$DIR_B")"; then
+    TAR_B_WALL=$LAST_WALL
+    TAR_B_RSS=$LAST_RSS_KB
+else
+    echo "  FAILED: tar B (exit $LAST_RC)"
+fi
+TAR_A_SZ=$(stat -c%s "$TAR_A" 2>/dev/null || echo 0)
 if [ "$TAR_A_SZ" -gt "$TWO_GB" ]; then
     echo "  SKIPPED — tar of dir A is $(fmt_size "$TAR_A_SZ"), exceeds zstd 2 GB limit"
 else
     ZSTD_PATCH="$TMPDIR/b_delta.tar.zst"
     if run_cmd zstd -T0 --patch-from="$TAR_A" "$TAR_B" -o "$ZSTD_PATCH"; then
-        Z_COMP_WALL=$LAST_WALL
+        # Total compress = tar A + tar B + zstd
+        Z_COMP_WALL=$(awk "BEGIN{printf \"%.1f\", ${TAR_A_WALL:-0} + ${TAR_B_WALL:-0} + $LAST_WALL}")
         Z_COMP_RSS=$LAST_RSS_KB
+        [ "${TAR_A_RSS:-0}" -gt "$Z_COMP_RSS" ] && Z_COMP_RSS=${TAR_A_RSS}
+        [ "${TAR_B_RSS:-0}" -gt "$Z_COMP_RSS" ] && Z_COMP_RSS=${TAR_B_RSS}
         Z_PATCH_SZ=$(stat -c%s "$ZSTD_PATCH")
         Z_COMP_OK=1
-        print_summary "zstd delta compress" "$Z_COMP_WALL" "$Z_COMP_RSS" "$Z_PATCH_SZ" "$SZ_B"
+        print_summary "tar + zstd delta compress" "$Z_COMP_WALL" "$Z_COMP_RSS" "$Z_PATCH_SZ" "$SZ_B"
     else
         echo "  FAILED (exit $LAST_RC)"
     fi
 fi
 
-# ── 5. zstd delta decompress ──
+# ── 5. zstd delta decompress (zstd + untar) ──
 
 echo ""
-echo "=== 5. zstd delta decompress ==="
+echo "=== 5. zstd delta decompress (zstd + untar) ==="
 if [ "$Z_COMP_OK" -eq 1 ]; then
     ZSTD_RESTORED_TAR="$TMPDIR/b_restored.tar"
     if run_cmd zstd -d --long=31 --memory=2048MB --patch-from="$TAR_A" "$ZSTD_PATCH" -o "$ZSTD_RESTORED_TAR"; then
-        Z_DEC_WALL=$LAST_WALL
-        Z_DEC_RSS=$LAST_RSS_KB
+        ZSTD_DEC_WALL=$LAST_WALL
+        ZSTD_DEC_RSS=$LAST_RSS_KB
         ZSTD_RESTORED="$TMPDIR/zstd_restored"
         mkdir -p "$ZSTD_RESTORED"
-        tar xf "$ZSTD_RESTORED_TAR" -C "$ZSTD_RESTORED"
-        Z_DEC_SZ=$(dir_size "$ZSTD_RESTORED")
-        Z_DEC_OK=1
-        print_summary "zstd delta decompress" "$Z_DEC_WALL" "$Z_DEC_RSS" "$Z_DEC_SZ" ""
+        # Time untar too
+        if run_cmd tar xf "$ZSTD_RESTORED_TAR" -C "$ZSTD_RESTORED"; then
+            Z_DEC_WALL=$(awk "BEGIN{printf \"%.1f\", $ZSTD_DEC_WALL + $LAST_WALL}")
+            Z_DEC_RSS=$ZSTD_DEC_RSS
+            [ "$LAST_RSS_KB" -gt "$Z_DEC_RSS" ] && Z_DEC_RSS=$LAST_RSS_KB
+            Z_DEC_SZ=$(dir_size "$ZSTD_RESTORED")
+            Z_DEC_OK=1
+            print_summary "zstd delta + untar" "$Z_DEC_WALL" "$Z_DEC_RSS" "$Z_DEC_SZ" ""
+        else
+            echo "  FAILED: untar (exit $LAST_RC)"
+        fi
     else
-        echo "  FAILED (exit $LAST_RC)"
+        echo "  FAILED: zstd decompress (exit $LAST_RC)"
     fi
 else
     echo "  SKIPPED (zstd compress was skipped or failed)"
@@ -274,14 +293,14 @@ fi
 if [ "$Z_COMP_OK" -eq 1 ]; then
     Z_RATIO=$(awk "BEGIN{printf \"%.2fx\", $SZ_B/$Z_PATCH_SZ}")
     printf "  %-30s %12s %12s %12s %10s\n" \
-        "zstd delta compress" "$(fmt_wall "$Z_COMP_WALL")" "$(fmt_size $((Z_COMP_RSS * 1024)))" "$(fmt_size "$Z_PATCH_SZ")" "$Z_RATIO"
+        "tar + zstd delta compress" "$(fmt_wall "$Z_COMP_WALL")" "$(fmt_size $((Z_COMP_RSS * 1024)))" "$(fmt_size "$Z_PATCH_SZ")" "$Z_RATIO"
 else
-    printf "  %-30s %12s\n" "zstd delta compress" "FAILED"
+    printf "  %-30s %12s\n" "tar + zstd delta compress" "FAILED"
 fi
 
 if [ "$Z_DEC_OK" -eq 1 ]; then
     printf "  %-30s %12s %12s %12s %10s\n" \
-        "zstd delta decompress" "$(fmt_wall "$Z_DEC_WALL")" "$(fmt_size $((Z_DEC_RSS * 1024)))" "$(fmt_size "$Z_DEC_SZ")" "-"
+        "zstd delta + untar" "$(fmt_wall "$Z_DEC_WALL")" "$(fmt_size $((Z_DEC_RSS * 1024)))" "$(fmt_size "$Z_DEC_SZ")" "-"
 else
-    printf "  %-30s %12s\n" "zstd delta decompress" "FAILED"
+    printf "  %-30s %12s\n" "zstd delta + untar" "FAILED"
 fi
