@@ -4,7 +4,6 @@
  * Commands:
  *   quine compress   <dir_a> <dir_b> <output.qn>
  *   quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>
- *   quine compare    <dir_a> <dir_b>
  */
 #include "quine/quine.h"
 
@@ -175,64 +174,6 @@ static int64_t parse_size(const char *s) {
     return (int64_t)val;
 }
 
-/* ── Compare helpers ─────────────────────────────────────────────────────── */
-
-static int files_equal(const char *a, const char *b) {
-    struct stat sa, sb;
-    if (stat(a, &sa) || stat(b, &sb)) return 0;
-    if (sa.st_size != sb.st_size) return 0;
-
-    int fa = open(a, O_RDONLY);
-    int fb = open(b, O_RDONLY);
-    if (fa < 0 || fb < 0) { if (fa >= 0) close(fa); if (fb >= 0) close(fb); return 0; }
-
-    #define CMP_BUF (256 * 1024)
-    uint8_t bufa[CMP_BUF], bufb[CMP_BUF];
-    int eq = 1;
-    while (eq) {
-        ssize_t na = read(fa, bufa, CMP_BUF);
-        ssize_t nb = read(fb, bufb, CMP_BUF);
-        if (na != nb) { eq = 0; break; }
-        if (na == 0) break;
-        if (memcmp(bufa, bufb, (size_t)na)) eq = 0;
-    }
-    close(fa); close(fb);
-    return eq;
-    #undef CMP_BUF
-}
-
-static int dirs_equal(const char *a, const char *b) {
-    DIR *da = opendir(a);
-    if (!da) return 0;
-    struct dirent *de;
-    int ok = 1;
-    while (ok && (de = readdir(da))) {
-        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
-        char pa[4096], pb[4096];
-        snprintf(pa, sizeof(pa), "%s/%s", a, de->d_name);
-        snprintf(pb, sizeof(pb), "%s/%s", b, de->d_name);
-        struct stat st;
-        if (lstat(pa, &st)) { ok = 0; break; }
-        if (S_ISDIR(st.st_mode)) ok = dirs_equal(pa, pb);
-        else                     ok = files_equal(pa, pb);
-    }
-    closedir(da);
-    if (!ok) return 0;
-
-    /* Reverse check: verify b has no extra entries missing from a */
-    DIR *db = opendir(b);
-    if (!db) return 0;
-    while ((de = readdir(db))) {
-        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
-        char pa[4096];
-        snprintf(pa, sizeof(pa), "%s/%s", a, de->d_name);
-        struct stat st;
-        if (lstat(pa, &st)) { ok = 0; break; }
-    }
-    closedir(db);
-    return ok;
-}
-
 /* ── Commands ────────────────────────────────────────────────────────────── */
 
 static int cmd_compress(const char *dir_a, const char *dir_b,
@@ -323,28 +264,6 @@ static int cmd_decompress(const char *dir_a, const char *patch_path,
     return 0;
 }
 
-static int cmd_compare(const char *dir_a, const char *dir_b) {
-    Timer t;
-    timer_start(&t);
-
-    printf("comparing %s vs %s ...\n", dir_a, dir_b);
-    int eq = dirs_equal(dir_a, dir_b);
-
-    double wall = timer_wall(&t);
-    double user, sys, cores;
-    timer_cpu(&t, wall, &user, &sys, &cores);
-    long rss = peak_rss_kb();
-    print_stats("compare", wall, user, sys, cores, rss);
-
-    if (eq) {
-        printf("  OK: directories are identical\n");
-        return 0;
-    } else {
-        fprintf(stderr, "  FAIL: directories differ\n");
-        return 1;
-    }
-}
-
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -353,7 +272,6 @@ int main(int argc, char **argv) {
             "Usage:\n"
             "  quine compress   <dir_a> <dir_b> <output.qn>\n"
             "  quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>\n"
-            "  quine compare    <dir_a> <dir_b>\n"
             "\n"
             "SIZE examples: 10M, 512K, 1G\n");
         return 1;
@@ -385,9 +303,6 @@ int main(int argc, char **argv) {
         }
         return cmd_decompress(argv[argi], argv[argi+1], argv[argi+2], max_mem_kb);
     }
-
-    if (!strcmp(argv[1], "compare") && argc == 4)
-        return cmd_compare(argv[2], argv[3]);
 
     fprintf(stderr, "Unknown command: %s\n", argv[1]);
     return 1;

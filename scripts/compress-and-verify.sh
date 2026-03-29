@@ -117,7 +117,8 @@ echo ""
 
 echo ""
 echo "=== Step 4: Compare ==="
-"$QUINE" compare "$DIR_B" "$RESTORED"
+echo "  diff -rq $DIR_B $RESTORED"
+diff -rq "$DIR_B" "$RESTORED"
 
 VERIFIED=1
 echo ""

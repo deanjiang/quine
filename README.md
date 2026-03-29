@@ -88,16 +88,6 @@ flag causes the command to fail if peak RSS exceeds the given limit (e.g.
 `10M`, `512K`, `1G`).  This is useful in CI to enforce the decompressor's
 memory guarantees.
 
-### Compare
-
-```bash
-build/quine compare <dir_a> <dir_b>
-```
-
-Byte-compares two directories recursively.  Exits 0 if identical, 1 if they
-differ.  Uses streaming 256 KB chunks — constant memory regardless of file
-sizes.
-
 ### Scripts
 
 **Compress and verify** — compress, zip, unzip, decompress, compare:
@@ -110,7 +100,7 @@ sizes.
   `patch_file.qn` and `patch_file.qn.zip` are kept on success, removed on
   failure.  If omitted, uses temp files for test-only verification.
 - `max_mem` defaults to `10M` — the peak RSS limit for decompression
-- Steps: compress → zip → unzip → decompress (from zip) → compare
+- Steps: compress → zip → unzip → decompress (from zip) → `diff -rq`
 - Verification starts from the zipped file to prove the full round-trip
 - Exits non-zero if any step fails
 
