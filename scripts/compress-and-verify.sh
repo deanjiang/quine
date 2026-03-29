@@ -118,7 +118,11 @@ echo ""
 echo ""
 echo "=== Step 4: Compare ==="
 echo "  diff -rq $DIR_B $RESTORED"
+CMP_START=$(date +%s%N)
 diff -rq "$DIR_B" "$RESTORED"
+CMP_END=$(date +%s%N)
+CMP_WALL=$(awk "BEGIN{printf \"%.1f\", ($CMP_END - $CMP_START) / 1000000000}")
+echo "  OK: directories are identical  (${CMP_WALL}s)"
 
 VERIFIED=1
 echo ""
