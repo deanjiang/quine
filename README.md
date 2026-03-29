@@ -41,23 +41,6 @@ sudo apt install -y build-essential libssl-dev
 
 ---
 
-## Project layout
-
-```
-include/quine/quine.h       public header
-src/quine.c                 library implementation
-tests/test.c                test suite (22 tests)
-main.c                      CLI driver
-scripts/
-  compress-and-verify.sh    compress + decompress + compare
-  benchmark.sh              benchmark quine vs zstd
-docs/
-  quine-algorithm.md        algorithm and I/O design notes
-  libquine.md               library API documentation
-  patch-format-v3.md        binary patch format specification
-Makefile
-build/                      all generated artifacts (gitignored)
-```
 
 ## Build
 
