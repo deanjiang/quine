@@ -13,12 +13,14 @@ Quine is available as a **C library** (`libquine`) and a **CLI tool**.
 
 ## Performance
 
-Benchmarked on ~1 GB model weight directories (8 files, WSL2 on NVMe):
+Benchmarked end-to-end on ~1 GB model weight directories (8 files, WSL2 on
+NVMe).  zstd times include the required `tar`/`untar` steps since
+`zstd --patch-from` operates on single files:
 
-| | quine + zip | zstd --patch-from |
+| | quine + zip | tar + zstd delta |
 |---|---|---|
-| **Compress time** | 10.1s | 1.7s |
-| **Decompress time** | 6.5s | 1.1s |
+| **Compress time** | **9.9s** | 20.5s |
+| **Decompress time** | 7.2s | 11.9s |
 | **Output size** | 175 MB (5.40x) | 173 MB (5.47x) |
 | **Decompress memory** | **6.4 MB** | 1.52 GB |
 | **Max input size** | **unlimited** | 2 GB |
@@ -27,6 +29,10 @@ Benchmarked on ~1 GB model weight directories (8 files, WSL2 on NVMe):
 ratios within 1% of zstd's byte-level delta mode (5.40x vs 5.47x).  Quine
 handles the structural dedup via CDC; zip compresses the remaining literal
 bytes.
+
+**Faster end-to-end compression.** quine + zip compresses 2x faster than
+tar + zstd because quine operates directly on directories — no tar step
+needed.
 
 **Minimal decompression memory.** The decompressor uses a fixed ~6.5 MB
 regardless of input size — a 4 MB read buffer, a 64 KB copy buffer, and a
