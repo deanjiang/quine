@@ -161,7 +161,7 @@ src/quine.c                 library implementation
 tests/test.c                test suite
 main.c                      CLI driver
 scripts/
-  verify-roundtrip.sh       compress + decompress + compare
+  compress-and-verify.sh    compress + decompress + compare
   benchmark.sh              benchmark quine vs zstd
 Makefile
 build/                      all generated artifacts (gitignored)
@@ -230,14 +230,15 @@ sizes.
 
 ### Scripts
 
-**Verify round-trip** — compress, decompress, and compare in sequence:
+**Compress and verify** — compress, decompress, compare, keep patch on success:
 
 ```bash
-./scripts/verify-roundtrip.sh <dir_a> <dir_b> [max_mem]
+./scripts/compress-and-verify.sh <dir_a> <dir_b> <patch_file> [max_mem]
 ```
 
+- `patch_file` — output patch file path (kept on success, removed on failure)
 - `max_mem` defaults to `10M` — the peak RSS limit for decompression
-- Compresses dir_b relative to dir_a
+- Compresses dir_b relative to dir_a into patch_file
 - Decompresses the patch (with `--verify-max-mem`)
 - Byte-compares the restored output against dir_b
 - Cleans up temporary files on exit
