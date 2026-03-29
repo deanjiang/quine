@@ -20,9 +20,9 @@ small slot table built from the file-size manifest in the patch header.
 
 ## Content-defined chunking (CDC)
 
-Each file is split into variable-length chunks (512 B – 64 KB, averaging ~2 KB)
+Each file is split into variable-length chunks (4 KB – 64 KB, averaging ~16 KB)
 using a Rabin rolling hash over a 48-byte sliding window.  A chunk boundary is
-declared whenever the low 11 bits of the hash are zero.
+declared whenever the low 14 bits of the hash are zero.
 
 Because boundaries are determined by the local content of the window — not by
 absolute byte position — they are **shift-resistant**: inserting bytes early in
@@ -172,7 +172,19 @@ Key findings:
   meaning the matched regions are naturally aligned at ≥4 KB boundaries in this
   data.
 
-The current defaults are `QN_CHUNK_MIN=512`, `QN_CHUNK_AVG=2048`,
+However, smaller chunks cause **severe decompression regression**: 2 KB avg
+produces ~8x more REF opcodes than 16 KB, each requiring a `pread()` syscall.
+Measured on WSL2:
+
+| Avg chunk | Decompress time (5 GB) | Decompress time (1 GB) |
+|-----------|----------------------|----------------------|
+| 2 KB | 135s | 43s |
+| 16 KB | 35s | 8s |
+
+The 4–5x decompression slowdown outweighs the compression ratio improvement,
+especially since post-compression zip achieves comparable ratios anyway.
+
+The current defaults are `QN_CHUNK_MIN=4096`, `QN_CHUNK_AVG=16384`,
 `QN_CHUNK_MAX=65536`.
 
 ## LIT data analysis

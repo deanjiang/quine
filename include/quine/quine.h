@@ -72,8 +72,8 @@
 
 /* ── Tuning ──────────────────────────────────────────────────────────────── */
 
-#define QN_CHUNK_MIN    512            /* 512 B — minimum chunk size            */
-#define QN_CHUNK_AVG    (2  * 1024)   /* 2 KB  — average (boundary mask = 11b)*/
+#define QN_CHUNK_MIN    (4  * 1024)   /* 4 KB  — minimum chunk size            */
+#define QN_CHUNK_AVG    (16 * 1024)   /* 16 KB — average (boundary mask = 14b)*/
 #define QN_CHUNK_MAX    (64 * 1024)   /* 64 KB — forced cut; decompressor buf */
 #define QN_RABIN_WINDOW 48            /* rolling hash window in bytes          */
 

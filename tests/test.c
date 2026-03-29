@@ -814,11 +814,9 @@ static void t_uneven_file_sizes(void) {
     if (r == -2) FAIL("decompress: %s", quine_errmsg());
     if (r == -3) FAIL("output mismatch");
 
-    /* All files identical → patch should be very small (all REFs).
-     * With smaller chunk sizes, more REF opcodes (13 bytes each) are needed,
-     * so allow up to 8 KB for the header + REF opcodes. */
+    /* All files identical → patch should be very small (all REFs) */
     int64_t psz = file_size(p);
-    if (psz > 8192)
+    if (psz > 4096)
         FAIL("patch (%lld B) too large for identical dirs", (long long)psz);
     PASS();
 }
