@@ -216,12 +216,13 @@ sizes.
 **Compress and verify** — compress, decompress, compare, keep patch on success:
 
 ```bash
-./scripts/compress-and-verify.sh <dir_a> <dir_b> <patch_file> [max_mem]
+./scripts/compress-and-verify.sh <dir_a> <dir_b> [patch_file] [max_mem]
 ```
 
-- `patch_file` — output patch file path (kept on success, removed on failure)
+- `patch_file` — output patch file path (kept on success, removed on failure);
+  if omitted, uses a temp file that is cleaned up after verification
 - `max_mem` defaults to `10M` — the peak RSS limit for decompression
-- Compresses dir_b relative to dir_a into patch_file
+- Compresses dir_b relative to dir_a
 - Decompresses the patch (with `--verify-max-mem`)
 - Byte-compares the restored output against dir_b
 - Cleans up temporary files on exit
