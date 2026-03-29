@@ -20,9 +20,9 @@ small slot table built from the file-size manifest in the patch header.
 
 ## Content-defined chunking (CDC)
 
-Each file is split into variable-length chunks (4–64 KB) using a Rabin rolling
-hash over a 48-byte sliding window.  A chunk boundary is declared whenever the
-low 14 bits of the hash are zero, giving an average chunk size of ~16 KB.
+Each file is split into variable-length chunks (512 B – 64 KB, averaging ~2 KB)
+using a Rabin rolling hash over a 48-byte sliding window.  A chunk boundary is
+declared whenever the low 11 bits of the hash are zero.
 
 Because boundaries are determined by the local content of the window — not by
 absolute byte position — they are **shift-resistant**: inserting bytes early in
@@ -145,3 +145,63 @@ The current implementation uses:
 
 On native Linux with ext4/NVMe, mmap may perform equally or better.  The
 buffered approach was chosen for portability and predictable RSS.
+
+## Chunk size tuning
+
+The chunk size parameters significantly affect compression ratio.  We
+simulated different average chunk sizes on a ~5 GB quantized model weight
+dataset (dir A = 4.36 GB, dir B = 5.02 GB):
+
+| Avg chunk | Chunks (A+B) | REF matched | LIT unmatched | Savings |
+|-----------|-------------|-------------|---------------|---------|
+| 1 KB | 9.7M | 940 MB | 4.10 GB | 17.9% |
+| **2 KB** | **4.8M** | **939 MB** | **4.10 GB** | **18.1%** |
+| 4 KB | 2.4M | 645 MB | 4.39 GB | 12.5% |
+| 8 KB | 1.2M | 645 MB | 4.39 GB | 12.5% |
+| 16 KB | 617K | 645 MB | 4.39 GB | 12.5% |
+
+Key findings:
+
+- **2 KB avg is the sweet spot** for this workload — 46% more REF matches than
+  16 KB (939 MB vs 645 MB) because partial changes within a 16 KB chunk cause
+  the entire chunk to become LIT, while at 2 KB only the ~2 KB around the
+  change is missed.
+- **Going below 2 KB doesn't help**: at 1 KB, the extra REF opcode overhead
+  (13 bytes × 5.6M chunks) eats into the gains from finer matching.
+- **4 KB and above plateau**: the REF matched bytes are identical at 4/8/16 KB,
+  meaning the matched regions are naturally aligned at ≥4 KB boundaries in this
+  data.
+
+The current defaults are `QN_CHUNK_MIN=512`, `QN_CHUNK_AVG=2048`,
+`QN_CHUNK_MAX=65536`.
+
+## LIT data analysis
+
+We analyzed whether a FIL (fill/repeat pattern) opcode would reduce patch size
+by replacing repeated byte patterns in LIT data.  Analysis of 3.91 GB of LIT
+data from the model weight workload:
+
+| Pattern type | Bytes | % of LIT |
+|-------------|-------|----------|
+| All-zero runs (≥ 4 KB) | 4.1 KB | 0.0% |
+| Single-byte repeat (≥ 4 KB) | 0 B | 0.0% |
+| Short pattern repeat (2-8 B) | 111 KB | 0.003% |
+| Unique/incompressible | 3.91 GB | 99.997% |
+
+**Conclusion**: FIL would not help for quantized model weights — the data is
+essentially random binary with no exploitable repeated patterns.  For workloads
+with significant zero-filled or pattern-filled regions (e.g., sparse matrices,
+padded binaries), FIL could be beneficial.
+
+## Comparison with zstd
+
+zstd's `--patch-from` delta mode achieves better compression than quine alone
+because it operates at byte-level granularity (vs chunk-level) and applies
+entropy coding (Huffman/FSE) to all data including unmatched bytes.  However,
+zstd's delta mode has a **2 GB dictionary limit** — it cannot handle reference
+directories larger than 2 GB.
+
+For best results, **pipe quine's output through zip/zstd**: quine handles the
+CDC-based delta dedup (no size limit), then zip/zstd compresses the remaining
+literal bytes.  The `compress-and-verify.sh` script does this automatically
+using zip.

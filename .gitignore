@@ -3,7 +3,7 @@ build/
 
 # Runtime outputs
 output/
-*.patch
+*.qn
 
 # Editor and OS
 .DS_Store

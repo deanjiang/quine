@@ -74,13 +74,13 @@ make CFLAGS="-g -O0 -Wall -Wextra -std=c11 -D_GNU_SOURCE"
 ### Compress
 
 ```bash
-build/quine compress <dir_a> <dir_b> <output.patch>
+build/quine compress <dir_a> <dir_b> <output.qn>
 ```
 
 ### Decompress
 
 ```bash
-build/quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>
+build/quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>
 ```
 
 `out_dir` is created if it does not exist.  The optional `--verify-max-mem`
@@ -100,31 +100,29 @@ sizes.
 
 ### Scripts
 
-**Compress and verify** — compress, decompress, compare, keep patch on success:
+**Compress and verify** — compress, zip, unzip, decompress, compare:
 
 ```bash
 ./scripts/compress-and-verify.sh <dir_a> <dir_b> [patch_file] [max_mem]
 ```
 
-- `patch_file` — output patch file path (kept on success, removed on failure);
-  if omitted, uses a temp file that is cleaned up after verification
+- `patch_file` — output name (`.qn` extension added if missing); both
+  `patch_file.qn` and `patch_file.qn.zip` are kept on success, removed on
+  failure.  If omitted, uses temp files for test-only verification.
 - `max_mem` defaults to `10M` — the peak RSS limit for decompression
-- Compresses dir_b relative to dir_a
-- Decompresses the patch (with `--verify-max-mem`)
-- Byte-compares the restored output against dir_b
-- Cleans up temporary files on exit
+- Steps: compress → zip → unzip → decompress (from zip) → compare
+- Verification starts from the zipped file to prove the full round-trip
 - Exits non-zero if any step fails
 
-**Benchmark** — compare quine against zstd with timing, RSS, and compression
-ratio:
+**Benchmark** — compare quine+zip against zstd delta:
 
 ```bash
 ./scripts/benchmark.sh <dir_a> <dir_b>
 ```
 
-Runs quine compress/decompress and zstd delta compress/decompress
-(`zstd --patch-from`), then prints a summary table.  Requires `zstd`
-and GNU `time` (`/usr/bin/time -v`).
+Runs quine compress, zip, unzip + decompress, and zstd delta
+compress/decompress, then prints a summary table.  Requires `zip`,
+`unzip`, `zstd`, and GNU `time` (`/usr/bin/time -v`).
 
 ---
 

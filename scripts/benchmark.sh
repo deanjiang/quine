@@ -1,17 +1,18 @@
 #!/bin/bash
 #
-# benchmark.sh — benchmark quine vs zstd delta compression
+# benchmark.sh — benchmark quine+zip vs zstd delta compression
 #
 # Usage:
 #   ./scripts/benchmark.sh <dir_a> <dir_b>
 #
-# Runs 4 tasks:
+# Runs 6 tasks:
 #   1. quine compress
-#   2. quine decompress
-#   3. zstd delta compress (zstd --patch-from)
-#   4. zstd delta decompress
+#   2. zip quine patch
+#   3. unzip + quine decompress
+#   4. zstd delta compress (zstd --patch-from)
+#   5. zstd delta decompress
 #
-# Requires: build/quine, zstd, tar, /usr/bin/time
+# Requires: build/quine, zstd, zip, unzip, tar, /usr/bin/time
 #
 
 set -uo pipefail
@@ -58,10 +59,7 @@ fmt_wall() {
     }"
 }
 
-# Run a command, show it, capture wall time + peak RSS via GNU time.
-# Sets: LAST_WALL (seconds), LAST_RSS_KB
 # Sets: LAST_WALL (seconds), LAST_RSS_KB, LAST_RC (exit code)
-# On failure, prints the command's error output.
 run_cmd() {
     echo "  \$ $*"
     /usr/bin/time -v "$@" 2>"$TMPDIR/time_out"
@@ -79,7 +77,6 @@ run_cmd() {
     LAST_RSS_KB=${LAST_RSS_KB:-0}
 
     if [ "$LAST_RC" -ne 0 ]; then
-        # Show command's error output (filter out /usr/bin/time lines)
         grep -v "^\t" "$TMPDIR/time_out" | grep -v "Command being timed" | head -5 | sed 's/^/  /'
     fi
     return $LAST_RC
@@ -89,8 +86,8 @@ print_summary() {
     local label="$1"
     local wall="$2"
     local rss_kb="$3"
-    local out_size="$4"   # bytes, or "" if N/A
-    local ref_size="$5"   # bytes for ratio calc, or "" if N/A
+    local out_size="$4"
+    local ref_size="$5"
 
     echo ""
     echo "  --- $label ---"
@@ -124,6 +121,7 @@ fi
 # ── Track results for summary table ──
 
 Q_COMP_WALL=0; Q_COMP_RSS=0; Q_PATCH_SZ=0; Q_COMP_OK=0
+Q_ZIP_WALL=0;  Q_ZIP_RSS=0;  Q_ZIP_SZ=0;   Q_ZIP_OK=0
 Q_DEC_WALL=0;  Q_DEC_RSS=0;  Q_DEC_SZ=0;   Q_DEC_OK=0
 Z_COMP_WALL=0; Z_COMP_RSS=0; Z_PATCH_SZ=0;  Z_COMP_OK=0
 Z_DEC_WALL=0;  Z_DEC_RSS=0;  Z_DEC_SZ=0;    Z_DEC_OK=0
@@ -132,7 +130,7 @@ Z_DEC_WALL=0;  Z_DEC_RSS=0;  Z_DEC_SZ=0;    Z_DEC_OK=0
 
 echo ""
 echo "=== 1. Quine compress ==="
-QUINE_PATCH="$TMPDIR/quine.patch"
+QUINE_PATCH="$TMPDIR/quine.qn"
 if run_cmd "$QUINE" compress "$DIR_A" "$DIR_B" "$QUINE_PATCH"; then
     Q_COMP_WALL=$LAST_WALL
     Q_COMP_RSS=$LAST_RSS_KB
@@ -143,18 +141,18 @@ else
     echo "  FAILED (exit $LAST_RC)"
 fi
 
-# ── 2. Quine decompress ──
+# ── 2. Zip quine patch ──
 
 echo ""
-echo "=== 2. Quine decompress ==="
-QUINE_RESTORED="$TMPDIR/quine_restored"
+echo "=== 2. Zip quine patch ==="
+QUINE_ZIP="$TMPDIR/quine.qn.zip"
 if [ "$Q_COMP_OK" -eq 1 ]; then
-    if run_cmd "$QUINE" decompress "$DIR_A" "$QUINE_PATCH" "$QUINE_RESTORED"; then
-        Q_DEC_WALL=$LAST_WALL
-        Q_DEC_RSS=$LAST_RSS_KB
-        Q_DEC_SZ=$(dir_size "$QUINE_RESTORED")
-        Q_DEC_OK=1
-        print_summary "quine decompress" "$Q_DEC_WALL" "$Q_DEC_RSS" "$Q_DEC_SZ" ""
+    if run_cmd zip -j -q "$QUINE_ZIP" "$QUINE_PATCH"; then
+        Q_ZIP_WALL=$LAST_WALL
+        Q_ZIP_RSS=$LAST_RSS_KB
+        Q_ZIP_SZ=$(stat -c%s "$QUINE_ZIP")
+        Q_ZIP_OK=1
+        print_summary "quine + zip" "$Q_ZIP_WALL" "$Q_ZIP_RSS" "$Q_ZIP_SZ" "$SZ_B"
     else
         echo "  FAILED (exit $LAST_RC)"
     fi
@@ -162,10 +160,42 @@ else
     echo "  SKIPPED (compress failed)"
 fi
 
-# ── 3. zstd delta compress ──
+# ── 3. Unzip + Quine decompress ──
 
 echo ""
-echo "=== 3. zstd delta compress ==="
+echo "=== 3. Unzip + Quine decompress ==="
+QUINE_RESTORED="$TMPDIR/quine_restored"
+if [ "$Q_ZIP_OK" -eq 1 ]; then
+    # Unzip
+    UNZIP_DIR="$TMPDIR/unzipped"
+    mkdir -p "$UNZIP_DIR"
+    if run_cmd unzip -o -q "$QUINE_ZIP" -d "$UNZIP_DIR"; then
+        UNZIP_WALL=$LAST_WALL
+        UNZIP_RSS=$LAST_RSS_KB
+        UNZIPPED_PATCH="$UNZIP_DIR/$(basename "$QUINE_PATCH")"
+        # Decompress
+        if run_cmd "$QUINE" decompress "$DIR_A" "$UNZIPPED_PATCH" "$QUINE_RESTORED"; then
+            Q_DEC_WALL=$(awk "BEGIN{printf \"%.1f\", $UNZIP_WALL + $LAST_WALL}")
+            Q_DEC_RSS=$LAST_RSS_KB
+            # Use max RSS of unzip and decompress
+            [ "$UNZIP_RSS" -gt "$Q_DEC_RSS" ] && Q_DEC_RSS=$UNZIP_RSS
+            Q_DEC_SZ=$(dir_size "$QUINE_RESTORED")
+            Q_DEC_OK=1
+            print_summary "unzip + quine decompress" "$Q_DEC_WALL" "$Q_DEC_RSS" "$Q_DEC_SZ" ""
+        else
+            echo "  FAILED: quine decompress (exit $LAST_RC)"
+        fi
+    else
+        echo "  FAILED: unzip (exit $LAST_RC)"
+    fi
+else
+    echo "  SKIPPED (zip failed)"
+fi
+
+# ── 4. zstd delta compress ──
+
+echo ""
+echo "=== 4. zstd delta compress ==="
 TAR_A="$TMPDIR/a.tar"
 TAR_B="$TMPDIR/b.tar"
 echo "  \$ tar cf $TAR_A ..."
@@ -188,10 +218,10 @@ else
     fi
 fi
 
-# ── 4. zstd delta decompress ──
+# ── 5. zstd delta decompress ──
 
 echo ""
-echo "=== 4. zstd delta decompress ==="
+echo "=== 5. zstd delta decompress ==="
 if [ "$Z_COMP_OK" -eq 1 ]; then
     ZSTD_RESTORED_TAR="$TMPDIR/b_restored.tar"
     if run_cmd zstd -d --long=31 --memory=2048MB --patch-from="$TAR_A" "$ZSTD_PATCH" -o "$ZSTD_RESTORED_TAR"; then
@@ -214,35 +244,44 @@ fi
 
 echo ""
 echo "=== Summary ==="
-printf "  %-25s %12s %12s %12s %10s\n" "Task" "Wall Time" "Peak RSS" "Output" "Ratio"
-printf "  %-25s %12s %12s %12s %10s\n" "-------------------------" "------------" "------------" "------------" "----------"
+printf "  %-30s %12s %12s %12s %10s\n" "Task" "Wall Time" "Peak RSS" "Output" "Ratio"
+printf "  %-30s %12s %12s %12s %10s\n" "------------------------------" "------------" "------------" "------------" "----------"
 
 if [ "$Q_COMP_OK" -eq 1 ]; then
     Q_RATIO=$(awk "BEGIN{printf \"%.2fx\", $SZ_B/$Q_PATCH_SZ}")
-    printf "  %-25s %12s %12s %12s %10s\n" \
+    printf "  %-30s %12s %12s %12s %10s\n" \
         "quine compress" "$(fmt_wall "$Q_COMP_WALL")" "$(fmt_size $((Q_COMP_RSS * 1024)))" "$(fmt_size "$Q_PATCH_SZ")" "$Q_RATIO"
 else
-    printf "  %-25s %12s\n" "quine compress" "FAILED"
+    printf "  %-30s %12s\n" "quine compress" "FAILED"
+fi
+
+if [ "$Q_ZIP_OK" -eq 1 ]; then
+    QZ_RATIO=$(awk "BEGIN{printf \"%.2fx\", $SZ_B/$Q_ZIP_SZ}")
+    Q_TOTAL_COMP_WALL=$(awk "BEGIN{printf \"%.1f\", $Q_COMP_WALL + $Q_ZIP_WALL}")
+    printf "  %-30s %12s %12s %12s %10s\n" \
+        "quine compress + zip" "$(fmt_wall "$Q_TOTAL_COMP_WALL")" "$(fmt_size $((Q_COMP_RSS * 1024)))" "$(fmt_size "$Q_ZIP_SZ")" "$QZ_RATIO"
+else
+    printf "  %-30s %12s\n" "quine compress + zip" "FAILED"
 fi
 
 if [ "$Q_DEC_OK" -eq 1 ]; then
-    printf "  %-25s %12s %12s %12s %10s\n" \
-        "quine decompress" "$(fmt_wall "$Q_DEC_WALL")" "$(fmt_size $((Q_DEC_RSS * 1024)))" "$(fmt_size "$Q_DEC_SZ")" "-"
+    printf "  %-30s %12s %12s %12s %10s\n" \
+        "unzip + quine decompress" "$(fmt_wall "$Q_DEC_WALL")" "$(fmt_size $((Q_DEC_RSS * 1024)))" "$(fmt_size "$Q_DEC_SZ")" "-"
 else
-    printf "  %-25s %12s\n" "quine decompress" "FAILED"
+    printf "  %-30s %12s\n" "unzip + quine decompress" "FAILED"
 fi
 
 if [ "$Z_COMP_OK" -eq 1 ]; then
     Z_RATIO=$(awk "BEGIN{printf \"%.2fx\", $SZ_B/$Z_PATCH_SZ}")
-    printf "  %-25s %12s %12s %12s %10s\n" \
+    printf "  %-30s %12s %12s %12s %10s\n" \
         "zstd delta compress" "$(fmt_wall "$Z_COMP_WALL")" "$(fmt_size $((Z_COMP_RSS * 1024)))" "$(fmt_size "$Z_PATCH_SZ")" "$Z_RATIO"
 else
-    printf "  %-25s %12s\n" "zstd delta compress" "FAILED"
+    printf "  %-30s %12s\n" "zstd delta compress" "FAILED"
 fi
 
 if [ "$Z_DEC_OK" -eq 1 ]; then
-    printf "  %-25s %12s %12s %12s %10s\n" \
+    printf "  %-30s %12s %12s %12s %10s\n" \
         "zstd delta decompress" "$(fmt_wall "$Z_DEC_WALL")" "$(fmt_size $((Z_DEC_RSS * 1024)))" "$(fmt_size "$Z_DEC_SZ")" "-"
 else
-    printf "  %-25s %12s\n" "zstd delta decompress" "FAILED"
+    printf "  %-30s %12s\n" "zstd delta decompress" "FAILED"
 fi

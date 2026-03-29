@@ -2,8 +2,8 @@
  * main.c — CLI driver for quine
  *
  * Commands:
- *   quine compress   <dir_a> <dir_b> <output.patch>
- *   quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>
+ *   quine compress   <dir_a> <dir_b> <output.qn>
+ *   quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>
  *   quine compare    <dir_a> <dir_b>
  */
 #include "quine/quine.h"
@@ -351,8 +351,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "Usage:\n"
-            "  quine compress   <dir_a> <dir_b> <output.patch>\n"
-            "  quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>\n"
+            "  quine compress   <dir_a> <dir_b> <output.qn>\n"
+            "  quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>\n"
             "  quine compare    <dir_a> <dir_b>\n"
             "\n"
             "SIZE examples: 10M, 512K, 1G\n");
@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
         }
 
         if (argc - argi != 3) {
-            fprintf(stderr, "Usage: quine decompress [--verify-max-mem=SIZE] <dir_a> <input.patch> <out_dir>\n");
+            fprintf(stderr, "Usage: quine decompress [--verify-max-mem=SIZE] <dir_a> <input.qn> <out_dir>\n");
             return 1;
         }
         return cmd_decompress(argv[argi], argv[argi+1], argv[argi+2], max_mem_kb);

@@ -57,7 +57,7 @@ static void my_progress(const quine_progress_t *info, void *ctx) {
 }
 
 quine_set_progress(my_progress, NULL);
-quine_compress("/data/v1.0", "/data/v1.1", "/tmp/update.patch");
+quine_compress("/data/v1.0", "/data/v1.1", "/tmp/update.qn");
 ```
 
 Stages reported during compression: `scan_a`, `scan_b`, `mmap_b`, `index`,
@@ -71,11 +71,11 @@ Stages reported during compression: `scan_a`, `scan_b`, `mmap_b`, `index`,
 #include <stdio.h>
 
 int main(void) {
-    if (quine_compress("/data/v1.0", "/data/v1.1", "/tmp/update.patch")) {
+    if (quine_compress("/data/v1.0", "/data/v1.1", "/tmp/update.qn")) {
         fprintf(stderr, "%s\n", quine_errmsg());
         return 1;
     }
-    if (quine_decompress("/data/v1.0", "/tmp/update.patch", "/data/v1.1_out")) {
+    if (quine_decompress("/data/v1.0", "/tmp/update.qn", "/data/v1.1_out")) {
         fprintf(stderr, "%s\n", quine_errmsg());
         return 1;
     }

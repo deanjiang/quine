@@ -51,7 +51,7 @@ static void progress(const char *stage, const char *file,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define RABIN_POLY   0xbfe6b8a5bf378d83ULL
-#define CHUNK_MASK   ((1u << 14) - 1)          /* avg 16 KB */
+#define CHUNK_MASK   ((1u << 11) - 1)          /* avg 2 KB */
 
 static uint64_t g_rabin_table[256];
 static pthread_once_t g_rabin_once = PTHREAD_ONCE_INIT;

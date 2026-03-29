@@ -207,7 +207,7 @@ static void t_empty_dirs(void) {
     char a[1024], b[1024], p[1024], o[1024];
     mkdirs(P(a,sizeof(a),"t01/a"));
     mkdirs(P(b,sizeof(b),"t01/b"));
-    P(p,sizeof(p),"t01/out.patch");
+    P(p,sizeof(p),"t01/out.qn");
     P(o,sizeof(o),"t01/out");
 
     int r = roundtrip(a, b, p, o);
@@ -232,7 +232,7 @@ static void t_identical_file(void) {
     write_file(fa, data, sizeof(data));
     write_file(fb, data, sizeof(data));
 
-    P(p,sizeof(p),"t02/out.patch");
+    P(p,sizeof(p),"t02/out.qn");
     P(o,sizeof(o),"t02/out");
 
     int r = roundtrip(a, b, p, o);
@@ -263,7 +263,7 @@ static void t_entirely_new_file(void) {
     write_file(fa, da, sizeof(da));
     write_file(fb, db, sizeof(db));
 
-    P(p,sizeof(p),"t03/out.patch");
+    P(p,sizeof(p),"t03/out.qn");
     P(o,sizeof(o),"t03/out");
 
     int r = roundtrip(a, b, p, o);
@@ -305,7 +305,7 @@ static void t_small_text_diff(void) {
     write_file(fb, tb, total);
     free(ta); free(tb);
 
-    P(p,sizeof(p),"t04/out.patch");
+    P(p,sizeof(p),"t04/out.qn");
     P(o,sizeof(o),"t04/out");
 
     int r = roundtrip(a, b, p, o);
@@ -343,7 +343,7 @@ static void t_multiple_files(void) {
     prng_fill(newdata,sizeof(newdata),0xFFFF);
     snprintf(path,sizeof(path),"%s/new.bin",b);    write_file(path,newdata,sizeof(newdata));
 
-    P(p,sizeof(p),"t05/out.patch");
+    P(p,sizeof(p),"t05/out.qn");
     P(o,sizeof(o),"t05/out");
 
     int r = roundtrip(a, b, p, o);
@@ -375,7 +375,7 @@ static void t_intra_file_selfref(void) {
     write_file(fb, file_data, 2*sizeof(block));
     free(file_data);
 
-    P(p,sizeof(p),"t06/out.patch");
+    P(p,sizeof(p),"t06/out.qn");
     P(o,sizeof(o),"t06/out");
 
     int r = roundtrip(a, b, p, o);
@@ -410,7 +410,7 @@ static void t_inter_b_dedup(void) {
     write_file(fc1, blob, sizeof(blob));
     write_file(fc2, blob, sizeof(blob));
 
-    P(p,sizeof(p),"t07/out.patch");
+    P(p,sizeof(p),"t07/out.qn");
     P(o,sizeof(o),"t07/out");
 
     int r = roundtrip(a, b, p, o);
@@ -445,7 +445,7 @@ static void t_empty_file_in_b(void) {
     write_file(fb1, data, sizeof(data));
     write_file(fb2, NULL, 0);
 
-    P(p,sizeof(p),"t08/out.patch");
+    P(p,sizeof(p),"t08/out.qn");
     P(o,sizeof(o),"t08/out");
 
     int r = roundtrip(a, b, p, o);
@@ -483,7 +483,7 @@ static void t_exact_chunk_boundary(void) {
     snprintf(path,sizeof(path),"%s/avg.bin",b); write_file(path,d_avg,QN_CHUNK_AVG);
     free(d_min); free(d_max); free(d_avg);
 
-    P(p,sizeof(p),"t09/out.patch");
+    P(p,sizeof(p),"t09/out.qn");
     P(o,sizeof(o),"t09/out");
 
     int r = roundtrip(a, b, p, o);
@@ -510,7 +510,7 @@ static void t_subdirectories(void) {
     prng_fill(data,sizeof(data),0x9999);
     snprintf(path,sizeof(path),"%s/x/y/z/deep.bin",b); write_file(path,data,sizeof(data));
 
-    P(p,sizeof(p),"t10/out.patch");
+    P(p,sizeof(p),"t10/out.qn");
     P(o,sizeof(o),"t10/out");
 
     int r = roundtrip(a, b, p, o);
@@ -557,7 +557,7 @@ static void t_cross_file_boundary_match(void) {
 
     free(file1); free(file2);
 
-    P(p,sizeof(p),"t11/out.patch");
+    P(p,sizeof(p),"t11/out.qn");
     P(o,sizeof(o),"t11/out");
 
     int r = roundtrip(a, b, p, o);
@@ -583,7 +583,7 @@ static void t_all_zeros(void) {
     write_file(fb, zeros, sz);
     free(zeros);
 
-    P(p,sizeof(p),"t12/out.patch");
+    P(p,sizeof(p),"t12/out.qn");
     P(o,sizeof(o),"t12/out");
 
     int r = roundtrip(a, b, p, o);
@@ -597,7 +597,7 @@ static void t_all_zeros(void) {
 static void t_bad_magic(void) {
     char a[1024], p[1024], o[1024];
     mkdirs(P(a,sizeof(a),"t13/a"));
-    P(p,sizeof(p),"t13/bad.patch");
+    P(p,sizeof(p),"t13/bad.qn");
     P(o,sizeof(o),"t13/out");
 
     /* Write a patch file with corrupt magic */
@@ -624,8 +624,8 @@ static void t_version_mismatch(void) {
     char fb[1024]; snprintf(fb,sizeof(fb),"%s/f.bin",b);
     write_file(fb, data, sizeof(data));
 
-    P(p, sizeof(p),  "t14/good.patch");
-    P(p2,sizeof(p2), "t14/bad_ver.patch");
+    P(p, sizeof(p),  "t14/good.qn");
+    P(p2,sizeof(p2), "t14/bad_ver.qn");
     P(o, sizeof(o),  "t14/out");
 
     quine_compress(a, b, p);
@@ -684,7 +684,7 @@ static void t_large_realistic(void) {
     prng_fill(buf, sizeof(buf), 0xCCDD);
     snprintf(path,sizeof(path),"%s/src/newfeature.bin",b); write_file(path,buf,sizeof(buf));
 
-    P(p,sizeof(p),"t15/out.patch");
+    P(p,sizeof(p),"t15/out.qn");
     P(o,sizeof(o),"t15/out");
 
     int r = roundtrip(a, b, p, o);
@@ -712,8 +712,8 @@ static void t_idempotent(void) {
     char fb[1024]; snprintf(fb,sizeof(fb),"%s/data.bin",b);
     write_file(fb, data, sizeof(data));
 
-    P(p1,sizeof(p1),"t16/p1.patch");
-    P(p2,sizeof(p2),"t16/p2.patch");
+    P(p1,sizeof(p1),"t16/p1.qn");
+    P(p2,sizeof(p2),"t16/p2.qn");
     P(o, sizeof(o), "t16/out");
 
     quine_compress(a, b, p1);
@@ -757,7 +757,7 @@ static void t_offset_filter_no_fwd_ref(void) {
     write_file(f1, blob, sizeof(blob));
     write_file(f2, blob, sizeof(blob));
 
-    P(p,sizeof(p),"t17/out.patch");
+    P(p,sizeof(p),"t17/out.qn");
     P(o,sizeof(o),"t17/out");
 
     int r = roundtrip(a, b, p, o);
@@ -806,7 +806,7 @@ static void t_uneven_file_sizes(void) {
         write_file(pb, tiny, sizeof(tiny));
     }
 
-    P(p,sizeof(p),"t18/out.patch");
+    P(p,sizeof(p),"t18/out.qn");
     P(o,sizeof(o),"t18/out");
 
     int r = roundtrip(a, b, p, o);
@@ -814,9 +814,11 @@ static void t_uneven_file_sizes(void) {
     if (r == -2) FAIL("decompress: %s", quine_errmsg());
     if (r == -3) FAIL("output mismatch");
 
-    /* All files identical → patch should be very small (all REFs) */
+    /* All files identical → patch should be very small (all REFs).
+     * With smaller chunk sizes, more REF opcodes (13 bytes each) are needed,
+     * so allow up to 8 KB for the header + REF opcodes. */
     int64_t psz = file_size(p);
-    if (psz > 4096)
+    if (psz > 8192)
         FAIL("patch (%lld B) too large for identical dirs", (long long)psz);
     PASS();
 }
@@ -845,7 +847,7 @@ static void t_b_to_earlier_b_dedup(void) {
     snprintf(path,sizeof(path),"%s/bbb.bin",b); write_file(path,bloby,sizeof(bloby));
     snprintf(path,sizeof(path),"%s/ccc.bin",b); write_file(path,blobx,sizeof(blobx));
 
-    P(p,sizeof(p),"t19/out.patch");
+    P(p,sizeof(p),"t19/out.qn");
     P(o,sizeof(o),"t19/out");
 
     int r = roundtrip(a, b, p, o);
@@ -888,7 +890,7 @@ static void t_many_small_b_files(void) {
         write_file(path, buf, sizeof(shared) + 1024);
     }
 
-    P(p,sizeof(p),"t20/out.patch");
+    P(p,sizeof(p),"t20/out.qn");
     P(o,sizeof(o),"t20/out");
 
     int r = roundtrip(a, b, p, o);
@@ -938,7 +940,7 @@ static void t_lex_order_dedup_direction(void) {
     write_file(path, blob, 256*1024);
     free(blob);
 
-    P(p,sizeof(p),"t21/out.patch");
+    P(p,sizeof(p),"t21/out.qn");
     P(o,sizeof(o),"t21/out");
 
     int r = roundtrip(a, b, p, o);
@@ -973,7 +975,7 @@ static void t_verify_max_mem(void) {
     snprintf(fb,sizeof(fb),"%s/data.bin",b);
     write_file(fb, data, sizeof(data));
 
-    P(p,sizeof(p),"t22/out.patch");
+    P(p,sizeof(p),"t22/out.qn");
     P(o1,sizeof(o1),"t22/out1");
     P(o2,sizeof(o2),"t22/out2");
 

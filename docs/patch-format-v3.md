@@ -1,8 +1,8 @@
 # Quine Patch Format — Version 3
 
-This document specifies the binary format of patch files produced by quine v3.
-The version number is stored in the patch header; any change to the format
-requires a version bump.
+This document specifies the binary format of patch files (`.qn`) produced by
+quine v3.  The version number is stored in the patch header; any change to the
+format requires a version bump.
 
 ## Overview
 
