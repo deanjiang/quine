@@ -17,13 +17,13 @@ Quine uses content-defined chunking (CDC) with a Rabin rolling hash to split
 files into variable-length chunks, SHA-256 to identify them, and a parallel
 segment-based indexing strategy to saturate all CPU cores.
 
-See [quine-algorithm.md](quine-algorithm.md) for the full algorithm
+See [docs/quine-algorithm.md](docs/quine-algorithm.md) for the full algorithm
 description, including parallel indexing, query-time offset filtering,
 memory guarantees, and I/O design notes (mmap vs buffered read tradeoffs).
 
 ### Wire format
 
-See [patch-format-v3.md](patch-format-v3.md) for the binary patch format
+See [docs/patch-format-v3.md](docs/patch-format-v3.md) for the binary patch format
 specification.  The version number is stored in the patch header; any format
 change requires a version bump.
 
@@ -51,9 +51,10 @@ main.c                      CLI driver
 scripts/
   compress-and-verify.sh    compress + decompress + compare
   benchmark.sh              benchmark quine vs zstd
-quine-algorithm.md          algorithm and I/O design notes
-libquine.md                 library API documentation
-patch-format-v3.md          binary patch format specification
+docs/
+  quine-algorithm.md        algorithm and I/O design notes
+  libquine.md               library API documentation
+  patch-format-v3.md        binary patch format specification
 Makefile
 build/                      all generated artifacts (gitignored)
 ```
@@ -146,7 +147,7 @@ and GNU `time` (`/usr/bin/time -v`).
 
 ## Library API
 
-See [libquine.md](libquine.md) for the full API documentation, progress
+See [docs/libquine.md](docs/libquine.md) for the full API documentation, progress
 callback usage, code examples, and linking instructions.
 
 ---
